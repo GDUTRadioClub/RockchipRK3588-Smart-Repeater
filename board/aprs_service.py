@@ -1361,7 +1361,7 @@ CREATE TABLE IF NOT EXISTS aprs_packets (
     lat REAL, lon REAL, symbol_table TEXT, symbol_code TEXT,
     comment TEXT, ambiguity INTEGER,
     course REAL, speed_kt REAL, alt_m REAL,
-    wx_json TEXT, telemetry_json TEXT, mice_json TEXT, mice_json TEXT,
+    wx_json TEXT, telemetry_json TEXT, mice_json TEXT,
     msg_to TEXT, msg_text TEXT, msg_id TEXT,
     obj_name TEXT,
     source TEXT DEFAULT 'rx',
@@ -1383,6 +1383,184 @@ CREATE TABLE IF NOT EXISTS aprs_tx (
 );
 CREATE INDEX IF NOT EXISTS idx_aprstx_ts ON aprs_tx(ts_epoch);
 """
+
+
+# ===========================================================================
+# 七、位置检索：距离 / 方位 / 站点反查（语音助手的位置类工具复用这里）
+# ===========================================================================
+# 全部是纯函数：不碰数据库、不碰线程，便于离线自测。
+# 目的：让中继台「知道」某台在哪，并用中文口语说出距离与方位
+# （「BI7KHI-9 在东北方向 3.2 公里」），供助手语音引导。
+
+_COMPASS_CN = ('北', '东北', '东', '东南', '南', '西南', '西', '西北')
+
+
+def haversine_km(lat1, lon1, lat2, lon2):
+    """两点大圆距离（公里）。无效输入返回 None。"""
+    try:
+        la1, lo1 = float(lat1), float(lon1)
+        la2, lo2 = float(lat2), float(lon2)
+    except (TypeError, ValueError):
+        return None
+    r = 6371.0088
+    p1, p2 = math.radians(la1), math.radians(la2)
+    dp = p2 - p1
+    dl = math.radians(lo2 - lo1)
+    a = (math.sin(dp / 2.0) ** 2
+         + math.cos(p1) * math.cos(p2) * math.sin(dl / 2.0) ** 2)
+    return 2.0 * r * math.asin(min(1.0, math.sqrt(a)))
+
+
+def bearing_deg(lat1, lon1, lat2, lon2):
+    """起点→终点的初始方位角（0=正北，顺时针）。无效输入返回 None。"""
+    try:
+        la1, lo1 = float(lat1), float(lon1)
+        la2, lo2 = float(lat2), float(lon2)
+    except (TypeError, ValueError):
+        return None
+    p1, p2 = math.radians(la1), math.radians(la2)
+    dl = math.radians(lo2 - lo1)
+    y = math.sin(dl) * math.cos(p2)
+    x = (math.cos(p1) * math.sin(p2)
+         - math.sin(p1) * math.cos(p2) * math.cos(dl))
+    return (math.degrees(math.atan2(y, x)) + 360.0) % 360.0
+
+
+def compass_cn(deg):
+    """方位角 → 中文八方位（北/东北/…）。"""
+    try:
+        d = float(deg) % 360.0
+    except (TypeError, ValueError):
+        return ''
+    return _COMPASS_CN[int(d / 45.0 + 0.5) % 8]
+
+
+def call_base(call):
+    """呼号去掉 SSID 后缀并大写：'bi7khi-9' → 'BI7KHI'。"""
+    return str(call or '').strip().upper().split('-')[0]
+
+
+def call_match(stored, want):
+    """呼号匹配：完全相同，或主呼号相同（BI7KHI 能匹配上 BI7KHI-9）。
+
+    空 want 视为「任意」——语音里用户往往只报主呼号。
+    """
+    a = str(stored or '').strip().upper()
+    b = str(want or '').strip().upper()
+    if not b:
+        return bool(a)
+    if not a:
+        return False
+    return a == b or call_base(a) == call_base(b)
+
+
+def call_exact(stored, want):
+    """呼号**完全**相同（含 SSID）。
+
+    专给「排除本站自己」用：这里绝不能用 call_match —— 它按主呼号匹配，会把
+    同一操作者的其它 SSID 一起排掉，而 BI7KHI-9 往往正是用户手上那台，
+    排掉它等于把要查的目标丢了。
+    """
+    return str(stored or '').strip().upper() == str(want or '').strip().upper()
+
+
+def pick_latest_station(items, want=''):
+    """从位置记录里挑出呼号匹配且 ts_epoch 最新的一条（无匹配返回 None）。
+
+    给了带 SSID 的呼号（BI7KHI-9）时**优先精确命中**：不然同操作者的
+    BI7KHI-10 只要比它新一点就会把答案顶掉，问谁答谁就不成立了。
+    精确的一个都没有时，才退回到「主呼号相同」的宽匹配。
+    空 want = 任意，取全局最新。
+    """
+    want = str(want or '').strip()
+    exact, loose = [], []
+    for it in (items or ()):
+        if not isinstance(it, dict):
+            continue
+        call = it.get('call') or it.get('src')
+        if not want:
+            loose.append(it)
+        elif call_exact(call, want):
+            exact.append(it)
+        elif call_match(call, want):
+            loose.append(it)
+    best = None
+    for it in (exact or loose):
+        if best is None or _f(it.get('ts_epoch'), 0.0) > _f(best.get('ts_epoch'), 0.0):
+            best = it
+    return best
+
+
+def station_brief(rec, home=None, now=None, exclude=()):
+    """把一条位置记录整理成**紧凑**结果（板端模型只看数值，别给整段 JSON）。
+
+    home 为本站位置 {lat,lon}；给了就附上距离与中文方位。
+    """
+    if not isinstance(rec, dict):
+        return None
+    call = str(rec.get('call') or rec.get('src') or '').strip()
+    if not call:
+        return None
+    for ex in (exclude or ()):
+        if ex and call_exact(call, ex):
+            return None
+    now = time.time() if now is None else now
+    lat, lon = _f(rec.get('lat'), None), _f(rec.get('lon'), None)
+    out = {'call': call, 'lat': round(lat, 5) if lat is not None else None,
+           'lon': round(lon, 5) if lon is not None else None}
+    se = _f(rec.get('ts_epoch'), 0.0)
+    if se > 0:
+        out['age_min'] = int(max(0.0, now - se) / 60.0)
+    if rec.get('comment'):
+        out['comment'] = str(rec['comment'])[:40]
+    if _f(rec.get('speed_kt'), None) is not None:
+        out['speed_kt'] = round(_f(rec['speed_kt'], 0.0), 1)
+    hl, ho = None, None
+    if isinstance(home, dict):
+        hl, ho = _f(home.get('lat'), None), _f(home.get('lon'), None)
+    if lat is not None and lon is not None and hl is not None and ho is not None:
+        km = haversine_km(hl, ho, lat, lon)
+        if km is not None:
+            out['km'] = round(km, 1)
+            out['dir'] = compass_cn(bearing_deg(hl, ho, lat, lon))
+    return out
+
+
+def nearest_stations(items, home=None, km=50.0, limit=5, exclude=()):
+    """按呼号去重（取最新），以 home 为中心挑出半径内最近的若干台。
+
+    home 缺失时退化为「最近听到的若干台」，不带距离。
+    """
+    try:
+        limit = max(1, min(20, int(limit)))
+    except (TypeError, ValueError):
+        limit = 5
+    try:
+        km = float(km)
+    except (TypeError, ValueError):
+        km = 50.0
+    best = {}
+    for it in (items or ()):
+        if not isinstance(it, dict):
+            continue
+        call = str(it.get('call') or it.get('src') or '').strip()
+        if not call:
+            continue
+        cur = best.get(call)
+        if cur is None or _f(it.get('ts_epoch'), 0.0) > _f(cur.get('ts_epoch'), 0.0):
+            best[call] = it
+    out = []
+    for call, it in best.items():
+        b = station_brief(it, home=home, exclude=exclude)
+        if b is None:
+            continue
+        if 'km' in b and km > 0 and b['km'] > km:
+            continue
+        out.append(b)
+    # 有距离的按距离排；没有距离（无本站坐标）时按时间新→旧
+    out.sort(key=lambda x: (x.get('km') if x.get('km') is not None else 1e9,
+                            x.get('age_min', 1e9)))
+    return out[:limit]
 
 
 class Store:
@@ -1438,7 +1616,7 @@ class Store:
 
 
 # ===========================================================================
-# 七、服务主体
+# 八、服务主体
 # ===========================================================================
 class AprsService:
     """APRS 收发服务。
@@ -1467,6 +1645,7 @@ class AprsService:
         self.run_flag = True
         self.tx_lock = threading.Lock()
         self.next_tx = {}            # ptype -> 下次发射 epoch
+        self._sched_iv = {}          # ptype -> 上次生效的间隔（秒），用于检测设置变更
         self.stats = {
             'rx_total': 0, 'rx_dropped': 0, 'tx_ok': 0, 'tx_fail': 0,
             'tx_deferred': 0, 'tx_skipped': 0, 'audio_s': 0.0,
@@ -1930,6 +2109,12 @@ class AprsService:
             if not _flag(st.get(flag_key), False):
                 continue
             iv = max(30.0, _f(st.get(iv_key), 1800.0))
+            if self._sched_iv.get(ptype) != iv:
+                # 间隔设置被改动（含首次）→ 立即按新间隔重新计时。
+                # 否则用户改完间隔要等旧周期走完才生效，看起来像“设置没起作用”。
+                self._sched_iv[ptype] = iv
+                self.next_tx[ptype] = now + iv + random.uniform(0, jit)
+                continue
             nxt = self.next_tx.get(ptype)
             if nxt is None:
                 self.next_tx[ptype] = now + iv + random.uniform(0, jit)
@@ -2071,9 +2256,81 @@ class AprsService:
         with self.lock:
             return list(self._stations.values())
 
+    # ---------------- 位置检索（语音助手的位置类工具）----------------
+    def home_position(self):
+        """本站自身位置（手填坐标或 NMEA GPS）。"""
+        try:
+            p = self.position.get() or {}
+        except Exception:
+            p = {}
+        lat, lon = _f(p.get('lat'), None), _f(p.get('lon'), None)
+        return {'lat': round(lat, 5) if lat is not None else None,
+                'lon': round(lon, 5) if lon is not None else None,
+                'alt_m': p.get('alt_m'), 'source': p.get('source') or '',
+                'valid': bool(p.get('valid'))}
+
+    def self_calls(self):
+        """本站自己的呼号（含 SSID 变体）；列「附近有谁」时要排除掉自己。"""
+        base = str(self.setting('aprs_mycall', '') or '').strip()
+        if not base:
+            return ()
+        ssid = str(self.setting('aprs_ssid', '') or '').strip()
+        out = [base]
+        if ssid not in ('', '0'):
+            out.append('%s-%s' % (base, ssid))
+        return tuple(out)
+
+    def _history_positions(self, hours=24, limit=2000):
+        """库里最近的位置包。按呼号去重交给纯函数做，这里只管取。"""
+        cut = time.time() - max(1.0, _f(hours, 24.0)) * 3600.0
+        try:
+            return self.store.query(
+                'SELECT src AS call, lat, lon, symbol_code, comment, ts, ts_epoch,'
+                ' speed_kt, alt_m FROM aprs_packets'
+                ' WHERE lat IS NOT NULL AND lon IS NOT NULL AND ts_epoch >= ?'
+                ' ORDER BY ts_epoch DESC LIMIT ?', (cut, int(limit))) or []
+        except Exception:
+            return []
+
+    def _station_pool(self, hours=24, limit=2000):
+        """内存最近表 ∪ 库历史。内存里的更新（刚收到就立刻可查），放前面。"""
+        pool = []
+        with self.lock:
+            pool.extend(dict(v) for v in self._stations.values())
+        pool.extend(self._history_positions(hours=hours, limit=limit))
+        return pool
+
+    def station_position(self, call=''):
+        """按呼号取最后已知位置；call 留空 = 最近听到的那一个台。
+
+        先查内存 _stations（新鲜、重启即失），再回落 aprs_packets 历史。
+        找不到返回 None——工具层要把它转成一句人话，而不是空字典。
+
+        本站自己的信标**一律**先排除：这个工具回答的是「**用户**在哪」，中继台
+        自己的坐标另有 get_home_position 工具，不该在这里冒充用户位置。
+        排除用 call_exact 而非 call_match——同一操作者的 BI7KHI-9 往往正是
+        用户手上那台，按主呼号排会把它一起误伤。
+
+        给了带 SSID 的呼号时优先精确命中，见 pick_latest_station。
+        """
+        want = str(call or '').strip()
+        ex = self.self_calls()
+        pool = [r for r in self._station_pool()
+                if not any(call_exact(r.get('call') or r.get('src'), x) for x in ex)]
+        rec = pick_latest_station(pool, want)
+        if rec is None:
+            return None
+        return station_brief(rec, home=self.home_position())
+
+    def nearby_stations(self, km=50.0, limit=5, hours=24):
+        """以本站为中心列出半径内最近的若干台（含距离与中文八方位）。"""
+        return nearest_stations(self._station_pool(hours=hours),
+                                home=self.home_position(), km=km,
+                                limit=limit, exclude=self.self_calls())
+
 
 # ===========================================================================
-# 八、自检
+# 九、自检
 # ===========================================================================
 def _selftest():
     """合成信号回环自检：构造报文 -> 调制 -> 解调 -> 逐字段比对。"""

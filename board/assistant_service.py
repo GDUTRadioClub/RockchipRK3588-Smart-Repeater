@@ -37,6 +37,7 @@ ASR 模型确实是同一份（`asr_service.ENGINE` 单例 + 解码锁，**没�
 """
 import json
 import math
+import inspect
 import queue
 import re
 import sqlite3
@@ -143,6 +144,16 @@ def _flag(v, d=False):
 
 def _now_iso():
     return datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+
+
+def _takes_kw(fn, name):
+    """fn 是否接受名为 name 的关键字参数（旧签名/测试替身返回 False）。"""
+    if fn is None:
+        return False
+    try:
+        return name in inspect.signature(fn).parameters
+    except Exception:
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -401,6 +412,8 @@ class AssistantService:
         self.stop_play_fn = stop_play_fn or (lambda: None)
         self.base_prompt_fn = base_prompt_fn or (lambda: '')
         self.expand_fn = expand_fn or (lambda t: t)
+        # ask_fn 要不要收 sysprompt=：测试替身用的是旧签名，硬传会 TypeError
+        self._ask_takes_sysprompt = _takes_kw(ask_fn, 'sysprompt')
 
     def settings(self, force=False):
         now = time.time()
@@ -828,6 +841,10 @@ class AssistantService:
         except Exception:
             base = ''
         prompt, prompt_chars = self._build_prompt(question, st, base)
+        # 总结轮要**重新**拿到「基础设定 + 语音播报规范」：真正被朗读的文本是
+        # 总结轮产出的，而第一轮在 force_first 下被要求「只输出读取指令、不要
+        # 回答用户」。约束只留在第一轮 = 对最终答案零生效（现场 bug）。
+        sysprompt = '\n'.join([x for x in (base, self._spec_text(st)) if x])
         # 只有 ack 是固定短语，不必过 LLM；其余一律走 LLM
         reply, llm_ms, provider, model, iters, tools, lerr = '', 0, '', '', 0, '', ''
         if kind == 'ack':
@@ -837,11 +854,14 @@ class AssistantService:
                 lerr = 'LLM 调用未注入'
             else:
                 try:
+                    kw = ({'sysprompt': sysprompt}
+                          if self._ask_takes_sysprompt else {})
                     r = self.ask_fn(prompt, question,
                                     int(_f(st.get('assist_max_tokens'), 256)),
                                     _f(st.get('assist_temperature'), 0.3),
                                     _flag(st.get('assist_use_tools'), True),
-                                    int(_f(st.get('assist_agent_iters'), 2))) or {}
+                                    int(_f(st.get('assist_agent_iters'), 2)),
+                                    **kw) or {}
                 except Exception as e:
                     r = {'ok': False, 'error': '%s: %s' % (type(e).__name__, e)}
                 llm_ms = int(r.get('ms') or 0)
@@ -933,22 +953,40 @@ class AssistantService:
             LOG, kind, heard[:40], speak[:60], tx_seconds,
             '，已截断' if truncated else ''), flush=True)
 
+    def _spec_text(self, st):
+        """展开后的「语音播报约束」原文（{max_chars} 已代入）。
+
+        _build_prompt 与 _answer 必须用**同一份**文本，否则总结轮回灌的约束
+        会和第一轮说明的不一致。
+        """
+        suffix = (st.get('assist_prompt_suffix') or '').strip()
+        if not suffix:
+            return ''
+        try:
+            suffix = self.expand_fn(suffix)
+        except Exception:
+            pass
+        return suffix.replace('{max_chars}', str(self.max_chars(st)))
+
     def _build_prompt(self, question, st, base=''):
         """拼提示词并逐级降配，保证输入不超上限（防止挤爆本地上下文）。"""
-        suffix = (st.get('assist_prompt_suffix') or '').strip()
-        if suffix:
-            try:
-                suffix = self.expand_fn(suffix)
-            except Exception:
-                pass
-            suffix = suffix.replace('{max_chars}', str(self.max_chars(st)))
+        suffix = self._spec_text(st)
         head_full = '\n'.join([x for x in (base, suffix) if x])
+        # 降配版头部：**优先保住规范**，宁可砍共用基础设定。
+        # 旧实现是 head_full[:600]，只要基础设定本身 ≥600 字，这一刀就把规范
+        # 整段切掉（规范在基础设定之后），模型等于完全没被约束过。
+        if suffix:
+            room = max(0, 600 - len(suffix) - 1)
+            head_short = '\n'.join(
+                [x for x in ((base[:room] if room else ''), suffix) if x])
+        else:
+            head_short = base[:600]
         max_in = max(400, int(_f(st.get('assist_max_input_chars'), 3000)))
         n = self.hist_turns(st)
         q = (question or '').strip()[:400]
         variants = []
         for hist_n in (n, min(n, 3), min(n, 1), 0):
-            for head in (head_full, head_full[:600], ''):
+            for head in (head_full, head_short, suffix, ''):
                 parts = []
                 if head:
                     parts.append('【系统设定】\n' + head)

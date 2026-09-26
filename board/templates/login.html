@@ -5,6 +5,8 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>登录 - ELF2 智能中继控制中心</title>
   <link rel="stylesheet" href="{{ url_for('static', filename='css/app.css', v='20260912c') }}">
+  {# 空 favicon：登录页同样是独立模板，不继承 base.html，需自行抑制 /favicon.ico 404 #}
+  <link rel="icon" href="data:,">
 </head>
 <body class="login-body">
   <div class="login-card">

@@ -11,6 +11,7 @@
     category: '',
     kind: '',
     q: '',
+    pos: '',
     limit: 100,
     offset: 0,
     items: [],
@@ -159,6 +160,7 @@
       if (state.category) qs.set('category', state.category);
       if (state.kind) qs.set('kind', state.kind);
       if (state.q) qs.set('q', state.q);
+      if (state.pos) qs.set('pos', state.pos);
       const d = await api('/api/voice/list?' + qs.toString());
       state.items = d.items || [];
       renderList();
@@ -168,7 +170,8 @@
       $('#btn-vlog-prev').disabled = state.offset <= 0;
       $('#btn-vlog-next').disabled = state.offset + state.limit >= total;
       const st = d.stats || {};
-      $('#vlog-m-total-sub').textContent = '段 · 当前筛选 ' + state.items.length;
+      $('#vlog-m-total-sub').textContent = '段 · 当前筛选 ' + state.items.length
+        + (st.aprs_pos ? ' · 含位置 ' + st.aprs_pos : '');
       loadTimeline();
     } catch (e) {
       toast('加载失败：' + e.message, 'error');
@@ -215,6 +218,18 @@
         if (raw.length) t.title = '识别原文为 ' + raw.join('/') + '，已按白名单纠错';
         tags.appendChild(t);
       });
+      if (it.aprs_pos) {
+        // 尾音里解出了对方的 APRS 位置信标：标出来，坐标放 tooltip
+        const t = tag('aprs-pos', '位置 ' + (it.aprs_call || 'APRS'));
+        const bits = ['本段含 APRS 位置信息'];
+        if (it.aprs_call) bits.push('呼号 ' + it.aprs_call);
+        if (it.aprs_lat != null && it.aprs_lon != null) {
+          bits.push('坐标 ' + Number(it.aprs_lat).toFixed(4) + ', '
+                    + Number(it.aprs_lon).toFixed(4));
+        }
+        t.title = bits.join('：');
+        tags.appendChild(t);
+      }
       if (it.asr_status === 'pending' || it.asr_status === 'running') {
         tags.appendChild(tag('asr-' + it.asr_status, it.asr_status === 'running' ? '识别中' : '待识别'));
       } else if (it.asr_status === 'error') {
@@ -237,46 +252,203 @@
     });
   }
 
-  // ---------------- 全天时间轴 ----------------
+  // ---------------- 全天时间轴 + 区间缩放（range brush） ----------------
+  // 缩放状态：**不持久化**，切日期/刷新都回到全天（作者确认）。
+  const TL_FULL = 86400;
+  const TL_MIN = 60;                 // 最小可缩放区间 60 秒
+  const TL_STEPS = [60, 300, 600, 900, 1800, 3600, 7200, 10800, 21600, 43200, 86400];
+  let tlZoom = { a: 0, b: TL_FULL };
+  let tlItems = [];                  // 缓存当天段，缩放时不必重新请求
+  let tlDayStart = 0;
+
+  function tlFmt(sec) {
+    sec = Math.max(0, Math.min(TL_FULL, Math.round(sec)));
+    const p = n => String(n).padStart(2, '0');
+    return p(Math.floor(sec / 3600)) + ':' + p(Math.floor((sec % 3600) / 60))
+      + ':' + p(sec % 60);
+  }
+
+  // 配色优先级：APRS（含本机 APRS 发射）> 本机发射 > 语音 > 其它
+  function tlCls(it) {
+    const cat = it.category || '';
+    if (cat === 'aprs') return 'cat-aprs';
+    if (it.kind === 'tx' || it.kind === 'both') return 'cat-tx';
+    if (cat === 'voice') return 'cat-voice';
+    if (cat) return 'cat-' + cat;
+    return 'cat-empty';
+  }
+
+  function tlIsFull() { return tlZoom.a <= 0 && tlZoom.b >= TL_FULL; }
+
+  function drawAxis() {
+    const axis = $('#vlog-tl-axis');
+    if (!axis) return;
+    const a = tlZoom.a, b = tlZoom.b, win = Math.max(1, b - a);
+    const target = win / 6;
+    let step = TL_STEPS[TL_STEPS.length - 1];
+    for (const v of TL_STEPS) { if (v >= target) { step = v; break; } }
+    const out = [];
+    for (let t = Math.ceil(a / step) * step; t <= b + 1; t += step) {
+      out.push('<span style="left:' + (((t - a) / win) * 100) + '%">'
+        + tlFmt(t).slice(0, 5) + '</span>');
+    }
+    axis.innerHTML = out.join('');
+  }
+
+  function renderBlocks() {
+    const track = $('#vlog-tl-track');
+    if (!track) return;
+    track.innerHTML = '';
+    const a = tlZoom.a, b = tlZoom.b, win = Math.max(1, b - a);
+    tlItems.forEach(it => {
+      const t0 = it.epoch - tlDayStart;
+      const t1 = t0 + (it.seconds || 1);
+      if (t1 < a || t0 > b) return;                 // 完全在窗口外
+      const left = Math.max(0, Math.min(100, ((t0 - a) / win) * 100));
+      const w = Math.max(0, Math.min(100 - left, ((it.seconds || 1) / win) * 100));
+      const el = document.createElement('div');
+      el.className = 'vlog-tl-block ' + tlCls(it)
+        + (it.kind === 'tx' ? ' kind-tx' : '') + (it.kind === 'both' ? ' kind-both' : '')
+        + (state.selected === it.id ? ' sel' : '');
+      el.style.left = left + '%';
+      el.style.width = w + '%';
+      el.title = (it.ts_label || it.ts || '') + ' · ' + (it.kind_label || it.kind || '')
+        + ' · ' + (it.category_label || it.category || '待识别')
+        + ' · ' + (it.seconds || 0).toFixed(1) + 's';
+      el.dataset.id = it.id;
+      el.addEventListener('click', () => selectItem(it.id));
+      track.appendChild(el);
+    });
+    const nowSec = (Date.now() / 1000) - tlDayStart;
+    if (state.day === today() && nowSec >= a && nowSec <= b) {
+      const n = document.createElement('div');
+      n.className = 'vlog-tl-now';
+      n.style.left = (((nowSec - a) / win) * 100) + '%';
+      track.appendChild(n);
+    }
+    markTimelineCursor();
+  }
+
+  function renderBrush() {
+    const bg = $('#vlog-tl-brush-bg');
+    const sel = $('#vlog-tl-brush-sel');
+    const bar = $('#vlog-tl-brush');
+    if (!bg || !sel || !bar) return;
+    if (bg.dataset.n !== String(tlItems.length)) {
+      bg.dataset.n = String(tlItems.length);
+      bg.innerHTML = '';
+      tlItems.forEach(it => {
+        const left = Math.max(0, Math.min(100, ((it.epoch - tlDayStart) / TL_FULL) * 100));
+        const w = Math.max(0.15, ((it.seconds || 1) / TL_FULL) * 100);
+        const i = document.createElement('i');
+        i.className = tlCls(it);
+        i.style.left = left + '%';
+        i.style.width = w + '%';
+        bg.appendChild(i);
+      });
+    }
+    sel.style.left = ((tlZoom.a / TL_FULL) * 100) + '%';
+    sel.style.width = (((tlZoom.b - tlZoom.a) / TL_FULL) * 100) + '%';
+    bar.classList.toggle('full', tlIsFull());
+    $$('.vlog-tl-handle', bar).forEach(h => {
+      h.setAttribute('aria-valuenow', String(Math.round(tlZoom[h.dataset.h])));
+      h.setAttribute('aria-valuetext', tlFmt(tlZoom[h.dataset.h]));
+    });
+    const lbl = $('#vlog-tl-range');
+    if (lbl) {
+      lbl.textContent = tlIsFull() ? '全天 24 小时'
+        : (tlFmt(tlZoom.a) + ' – ' + tlFmt(tlZoom.b) + '（跨度 ' + tlFmt(tlZoom.b - tlZoom.a) + '）');
+    }
+    const rst = $('#btn-tl-reset');
+    if (rst) rst.hidden = tlIsFull();
+    const hint = $('#vlog-tl-hint');
+    if (hint) hint.hidden = !tlIsFull();
+  }
+
+  function tlSet(a, b, quiet) {
+    a = Math.max(0, Math.min(TL_FULL - TL_MIN, a));
+    b = Math.min(TL_FULL, Math.max(a + TL_MIN, b));
+    if (b - a < TL_MIN) { b = Math.min(TL_FULL, a + TL_MIN); a = Math.max(0, b - TL_MIN); }
+    tlZoom = { a, b };
+    drawAxis(); renderBlocks(); renderBrush();
+    if (!quiet && state.selected) {
+      // 选中项被缩出窗口时保留选中态，但不再画游标（markTimelineCursor 已处理）
+    }
+  }
+
+  function tlReset() { tlSet(0, TL_FULL); }
+
+  function bindBrush() {
+    const bar = $('#vlog-tl-brush');
+    if (!bar) return;
+    let drag = null;
+    const secAt = ev => {
+      const r = bar.getBoundingClientRect();
+      return Math.max(0, Math.min(TL_FULL, ((ev.clientX - r.left) / Math.max(1, r.width)) * TL_FULL));
+    };
+    bar.addEventListener('pointerdown', ev => {
+      const hEl = ev.target.closest('.vlog-tl-handle');
+      if (hEl) {
+        drag = { mode: hEl.dataset.h };
+      } else if (ev.target.closest('.vlog-tl-brush-sel')) {
+        drag = { mode: 'pan', startX: ev.clientX, a0: tlZoom.a, b0: tlZoom.b };
+      } else {
+        // 点空白：以该时刻为中心平移（保持跨度）
+        const t = secAt(ev), half = (tlZoom.b - tlZoom.a) / 2;
+        tlSet(t - half, t + half);
+        return;
+      }
+      try { bar.setPointerCapture(ev.pointerId); } catch (e) { /* 忽略 */ }
+      const selEl = $('#vlog-tl-brush-sel');
+      if (selEl) selEl.classList.add('dragging');
+      ev.preventDefault();
+    });
+    bar.addEventListener('pointermove', ev => {
+      if (!drag) return;
+      if (drag.mode === 'pan') {
+        const r = bar.getBoundingClientRect();
+        const dt = ((ev.clientX - drag.startX) / Math.max(1, r.width)) * TL_FULL;
+        let a = drag.a0 + dt, b = drag.b0 + dt;
+        if (a < 0) { b -= a; a = 0; }
+        if (b > TL_FULL) { a -= (b - TL_FULL); b = TL_FULL; }
+        tlSet(a, b);
+      } else {
+        const t = secAt(ev);
+        if (drag.mode === 'a') tlSet(Math.min(t, tlZoom.b - TL_MIN), tlZoom.b);
+        else tlSet(tlZoom.a, Math.max(t, tlZoom.a + TL_MIN));
+      }
+      ev.preventDefault();
+    });
+    const end = () => {
+      drag = null;
+      const selEl = $('#vlog-tl-brush-sel');
+      if (selEl) selEl.classList.remove('dragging');
+    };
+    bar.addEventListener('pointerup', end);
+    bar.addEventListener('pointercancel', end);
+    bar.addEventListener('dblclick', ev => { tlReset(); ev.preventDefault(); });
+    // 键盘可达：Tab 聚焦手柄后用方向键微调，Shift 加速
+    $$('.vlog-tl-handle', bar).forEach(h => {
+      h.addEventListener('keydown', ev => {
+        const step = ev.shiftKey ? 3600 : 300;
+        const d = ev.key === 'ArrowLeft' ? -step : (ev.key === 'ArrowRight' ? step : 0);
+        if (!d) return;
+        ev.preventDefault();
+        if (h.dataset.h === 'a') tlSet(tlZoom.a + d, tlZoom.b);
+        else tlSet(tlZoom.a, tlZoom.b + d);
+      });
+    });
+  }
+
   async function loadTimeline() {
     try {
       const d = await api('/api/voice/timeline?day=' + encodeURIComponent(state.day));
-      const track = $('#vlog-tl-track');
-      track.innerHTML = '';
-      const dayStart = new Date(state.day + 'T00:00:00').getTime() / 1000;
-      const span = 86400;
-      (d.items || []).forEach(it => {
-        const left = Math.max(0, Math.min(100, ((it.epoch - dayStart) / span) * 100));
-        const w = Math.max(0.25, ((it.seconds || 1) / span) * 100);
-        const b = document.createElement('div');
-        // 配色优先级：APRS（含本机 APRS 发射）> 本机发射 > 语音 > 其它
-        // 后端 day_peaks 必须返回 category/kind，否则这里全落到 empty 变灰。
-        const cat = it.category || '';
-        let cls;
-        if (cat === 'aprs') cls = 'cat-aprs';
-        else if (it.kind === 'tx' || it.kind === 'both') cls = 'cat-tx';
-        else if (cat === 'voice') cls = 'cat-voice';
-        else if (cat) cls = 'cat-' + cat;
-        else cls = 'cat-empty';
-        b.className = 'vlog-tl-block ' + cls
-          + (it.kind === 'tx' ? ' kind-tx' : '') + (it.kind === 'both' ? ' kind-both' : '');
-        b.style.left = left + '%';
-        b.style.width = w + '%';
-        b.title = (it.ts || '') + ' · ' + (it.kind_label || it.kind || '')
-          + ' · ' + (it.category_label || cat || '待识别')
-          + ' · ' + (it.seconds || 0).toFixed(1) + 's';
-        b.dataset.id = it.id;
-        b.addEventListener('click', () => selectItem(it.id));
-        track.appendChild(b);
-      });
-      const now = Date.now() / 1000;
-      if (state.day === today() && now >= dayStart && now < dayStart + span) {
-        const n = document.createElement('div');
-        n.className = 'vlog-tl-now';
-        n.style.left = (((now - dayStart) / span) * 100) + '%';
-        track.appendChild(n);
-      }
-      markTimelineCursor();
+      tlItems = d.items || [];
+      tlDayStart = new Date(state.day + 'T00:00:00').getTime() / 1000;
+      tlZoom = { a: 0, b: TL_FULL };            // 换日期即回到全天
+      const bg = $('#vlog-tl-brush-bg');
+      if (bg) bg.dataset.n = '';                // 强制重画总览条
+      tlSet(0, TL_FULL);
     } catch (e) { /* 忽略 */ }
   }
 
@@ -288,16 +460,32 @@
     if (!state.selected) return;
     const it = state.items.find(x => x.id === state.selected);
     if (!it) return;
-    const dayStart = new Date(state.day + 'T00:00:00').getTime() / 1000;
+    // 游标位置按**当前缩放窗口**换算；缩出窗口外就不画（避免跑到轨道外面）
+    const t = (it.epoch - tlDayStart);
+    const win = Math.max(1, tlZoom.b - tlZoom.a);
+    if (t < tlZoom.a || t > tlZoom.b) return;
     const c = document.createElement('div');
     c.className = 'vlog-tl-cursor';
-    c.style.left = (((it.epoch - dayStart) / 86400) * 100) + '%';
+    c.style.left = (((t - tlZoom.a) / win) * 100) + '%';
     track.appendChild(c);
   }
 
   // ---------------- 详情 ----------------
   async function selectItem(id) {
     state.selected = id;
+    // 目标不在当前缩放区间内时，把窗口平移过去（保持跨度），否则点了色块却看不到游标
+    const hit = tlItems.find(x => x.id === id);
+    if (hit) {
+      const t0 = hit.epoch - tlDayStart;
+      const t1 = t0 + (hit.seconds || 0);
+      if (t1 < tlZoom.a || t0 > tlZoom.b) {
+        const win = tlZoom.b - tlZoom.a;
+        let a = (t0 + (hit.seconds || 0) / 2) - win / 2, b = a + win;
+        if (a < 0) { b -= a; a = 0; }
+        if (b > TL_FULL) { a -= (b - TL_FULL); b = TL_FULL; }
+        tlSet(Math.max(0, a), Math.min(TL_FULL, b), true);
+      }
+    }
     $$('.vlog-item').forEach(el => el.classList.toggle('sel', Number(el.dataset.id) === id));
     const it = state.items.find(x => x.id === id);
     if (!it) return;
@@ -500,11 +688,13 @@
     $('#btn-vlog-refresh').addEventListener('click', () => { loadDays(); loadList(); loadSummary(); loadStatus(); });
     $('#vlog-day').addEventListener('change', (e) => {
       state.day = e.target.value; state.offset = 0; state.selected = null;
+      tlZoom = { a: 0, b: TL_FULL };   // 换日期回到全天
       $('#vlog-detail').classList.add('hidden');
       loadList(); loadSummary();
     });
     $('#vlog-cat').addEventListener('change', (e) => { state.category = e.target.value; state.offset = 0; loadList(); });
     $('#vlog-kind').addEventListener('change', (e) => { state.kind = e.target.value; state.offset = 0; loadList(); });
+    $('#vlog-pos').addEventListener('change', (e) => { state.pos = e.target.value; state.offset = 0; loadList(); });
     $('#btn-vlog-search').addEventListener('click', () => { state.q = $('#vlog-q').value.trim(); state.offset = 0; loadList(); });
     $('#vlog-q').addEventListener('keydown', (e) => {
       if (e.key === 'Enter') { state.q = e.target.value.trim(); state.offset = 0; loadList(); }
@@ -559,18 +749,22 @@
 
   // ---------------- 启动 ----------------
   document.addEventListener('DOMContentLoaded', async () => {
+    bindBrush();
+    const _rst = $('#btn-tl-reset');
+    if (_rst) _rst.addEventListener('click', () => tlReset());
     await loadDays();
     bind();
     await loadStatus();
     await loadList();
     await loadSummary();
     await loadCsWhitelist();
-    loadStatus();
-    setInterval(loadStatus, 3000);
-    setInterval(() => {
+    // 上一次 settle 之后再排下一次。原来用 setInterval 不等返回，
+    // /api/voice/status 一变慢就会重叠堆积，把板端 GIL 抢死（见 static/js/poll.js）。
+    ELF2Poll.loop(loadStatus, 3000, { immediate: true });
+    ELF2Poll.loop(() => {
       const a = $('#vlog-audio');
       if (a && !a.paused) return;
-      loadList();
+      return loadList();
     }, 15000);
   });
 })();

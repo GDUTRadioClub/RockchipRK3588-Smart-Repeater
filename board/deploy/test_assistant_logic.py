@@ -17,6 +17,8 @@ from pathlib import Path
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).parent))
+sys.path.insert(0, str(Path(__file__).parent.parent))
+import agent_service as G
 import assistant_service as A
 
 FAIL = []
@@ -126,6 +128,69 @@ check('长历史时保留当前问题', '电压多少' in p2)
 svc3, st3 = make_svc({'assist_max_input_chars': '600'})
 p3, n3 = svc3._build_prompt('你好', st3, '很长很长的设定' * 200)
 check('设定超长时仍被截到上限', len(p3) <= 600, 'len=%d' % len(p3))
+
+# 现场 bug 回归：降配时**必须保住语音播报规范**。
+# 旧实现用 head_full[:600] 兜底，基础设定一超过 600 字就把规范整段切掉。
+MARK = '只输出可直接朗读的纯口语'
+svc4, st4 = make_svc()
+long_base = '基' * 1200
+p4, n4 = svc4._build_prompt('风速多少', st4, long_base)
+check('长基础设定下仍保留播报规范', MARK in p4, '规范被切掉了')
+check('长基础设定下仍不超上限', len(p4) <= 3000, 'len=%d' % len(p4))
+
+# 再挤：把上限压到刚好放不下「基础设定 + 规范」，规范仍要活着
+svc5, st5 = make_svc({'assist_max_input_chars': '600'})
+p5, n5 = svc5._build_prompt('风速多少', st5, long_base)
+check('上限吃紧时规范优先于基础设定', MARK in p5, 'len=%d' % len(p5))
+check('上限吃紧时仍不超上限', len(p5) <= 600, 'len=%d' % len(p5))
+
+# ---------------------------------------------------------------------------
+print('\n=== 4b. 总结轮的行为约束回灌（现场 bug 回归）===')
+# 真因：被朗读的文本是**总结轮**产出的，而第一轮在 force_first 下被要求
+# 「只输出读取指令、不要回答用户」。约束只写在第一轮 = 对答案零生效。
+SPEC = A.DEFAULTS['assist_prompt_suffix'].replace('{max_chars}', '100')
+
+m_short = G.summary_messages([{'get_power': {'battery': 12.6}}], '电池电压',
+                             SPEC, 'external', mode='auto')
+check('外部模型总结轮带约束', any(MARK in (m.get('content') or '')
+                                  for m in m_short))
+check('外部模型约束走 system 轮',
+      m_short[0].get('role') == 'system' and MARK in m_short[0]['content'])
+check('外部模型数据仍在 user 轮',
+      m_short[-1]['role'] == 'user' and '设备实时数据' in m_short[-1]['content'])
+check('外部模型仍带原始问题', '电池电压' in m_short[-1]['content'])
+
+m_off = G.summary_messages([{'get_power': {'battery': 12.6}}], '电池电压',
+                           SPEC, 'external', mode='off')
+check('mode=off 时完全不回灌（板端保命开关）',
+      all(MARK not in (m.get('content') or '') for m in m_off))
+
+m_local = G.summary_messages([{'get_power': {'battery': 12.6}}], '电池电压',
+                             SPEC, 'local', mode='auto')
+check('auto 下板端 RKLLM 不回灌（>400 字会空输出）',
+      all(MARK not in (m.get('content') or '') for m in m_local))
+
+m_local_on = G.summary_messages([{'get_power': {'battery': 12.6}}], '电池电压',
+                                SPEC, 'local', mode='on')
+check('强制 on 时板端走用户消息内联（RKLLM 不认 system 轮）',
+      m_local_on[0]['role'] == 'user' and '【播报要求】' in m_local_on[0]['content'])
+
+check('cap 生效', len(G.summary_spec('规' * 5000, 'external', cap=300)) == 300)
+check('空规范不注入', G.summary_spec('', 'external') == '')
+check('非法 mode 退回 auto', G.summary_spec(SPEC, 'external', mode='乱写') != '')
+check('总结轮数据段仍被截断（板端上下文）',
+      len(G.summary_messages([{'x': 'y' * 900}], 'q', SPEC, 'external')[-1]['content'])
+      < 900)
+
+# 网页 Agent 对话同款缺陷：总结轮也得带上基础设定，且收尾语沿用网页那一句
+m_web = G.summary_messages([{'get_power': {'battery': 12.6}}], '电池电压',
+                           '你是中继台助手。', 'external', mode='auto',
+                           tail='请用中文 1~3 句回答：')
+check('网页总结轮带基础设定', m_web[0]['role'] == 'system'
+      and '你是中继台助手。' in m_web[0]['content'])
+check('网页总结轮用自己的收尾语', '请用中文 1~3 句回答：' in m_web[-1]['content'])
+check('默认收尾语仍是助手那一句',
+      G.SUMMARY_TAIL_ASSIST in G.summary_messages([], 'q', SPEC, 'external')[-1]['content'])
 
 # ---------------------------------------------------------------------------
 print('\n=== 5. 能量分段状态机 ===')

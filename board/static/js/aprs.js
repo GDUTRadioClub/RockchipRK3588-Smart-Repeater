@@ -253,6 +253,8 @@
       var wx = null, tel = null;
       try { wx = p.wx_json ? JSON.parse(p.wx_json) : null; } catch (e) { }
       try { tel = p.telemetry_json ? JSON.parse(p.telemetry_json) : null; } catch (e) { }
+      var mice = null;
+      try { mice = p.mice_json ? JSON.parse(p.mice_json) : null; } catch (e) { }
       var kv = [
         ['时间', p.ts], ['来源', p.src], ['目的', p.dst], ['路径', p.path],
         ['类型', (p.dtype_label || '') + ' (' + (p.dtype || '') + ')'],
@@ -268,6 +270,15 @@
       kv.push(['信息字段', p.info || '']);
       if (wx) kv.push(['气象(已换算SI)', JSON.stringify(wx)]);
       if (tel) kv.push(['遥测', JSON.stringify(tel)]);
+      if (mice) {
+        kv.push(['Mic-E 目的地址', (mice.mice_dest || '') +
+          '（Mic-E 把纬度编码在目的地址里，这是本包的纬度来源）']);
+        kv.push(['Mic-E 半球', (mice.mice_lat_ns || '') + (mice.mice_lon_ew || '') +
+          '，经度偏移 +' + (mice.mice_lon_offset || 0) + '00°']);
+        kv.push(['Mic-E 状态位', (mice.mice_status || '') +
+          '（标准集 ' + (mice.mice_std_msg || 0) + ' / 自定义集 ' + (mice.mice_cust_msg || 0) + '）']);
+        kv.push(['Mic-E 类型', mice.mice_msg_capable ? '` 支持消息' : "' 单向追踪器"]);
+      }
       kv.push(['收录时间', p.created || '']);
 
       var html = '<div class="aprs-detail-head"><strong>' + esc(p.src) + '</strong>  ' +
@@ -329,6 +340,8 @@
         return names[k] + ' ' + (left > 0 ? fmtDur(left) + '后' : '即将');
       });
       $('#tx-next').textContent = parts.length ? parts.join(' · ') : '（未启用定时发射）';
+      schedFill(st);
+      schedNext(r.next_tx);
 
       // 统计页
       $('#stat-type').querySelector('tbody').innerHTML = (r.by_type || []).map(function (x) {
@@ -463,6 +476,13 @@
       });
     });
 
+    var schedBtn = $('#btn-sched-save');
+    if (schedBtn) schedBtn.addEventListener('click', schedSave);
+    var allOn = $('#btn-sched-all-on');
+    if (allOn) allOn.addEventListener('click', function () { schedAll(true); });
+    var allOff = $('#btn-sched-all-off');
+    if (allOff) allOff.addEventListener('click', function () { schedAll(false); });
+
     ['txt', 'csv', 'json'].forEach(function (f) {
       var el = $('#btn-aprs-export-' + f);
       if (el) el.addEventListener('click', function () {
@@ -471,17 +491,146 @@
     });
   }
 
+  /* ================= 定时发射计划（四项可调） ================= */
+  var schedLoaded = false;
+  var schedLastNext = {};
+  // pt = 服务端 next_tx 里的类型名；st = settings 里的键前缀（信标用的是 beacon）
+  var SCHED_ITEMS = [
+    { pt: 'weather',   st: 'weather',   label: '气象' },
+    { pt: 'position',  st: 'beacon',    label: '信标' },
+    { pt: 'telemetry', st: 'telemetry', label: '遥测' },
+    { pt: 'status',    st: 'status',    label: '状态' }
+  ];
+
+  function schedRows() { return $$('.sched-row'); }
+
+  function schedRowFor(pt) {
+    var found = null;
+    schedRows().forEach(function (row) { if (row.dataset.pt === pt) found = row; });
+    return found;
+  }
+
+  // 把秒数折成最易读的单位
+  function schedUnitFor(sec) {
+    if (sec >= 3600 && sec % 3600 === 0) return { unit: '3600', value: sec / 3600 };
+    if (sec >= 60 && sec % 60 === 0) return { unit: '60', value: sec / 60 };
+    return { unit: '1', value: sec };
+  }
+
+  // 只在首次与保存后回填，避免 4 秒轮询把用户正在改的内容冲掉
+  function schedFill(st) {
+    if (schedLoaded || !st) return;
+    SCHED_ITEMS.forEach(function (it) {
+      var row = schedRowFor(it.pt);
+      if (!row) return;
+      var sec = parseInt(st['aprs_' + it.st + '_interval'], 10);
+      if (!isFinite(sec) || sec <= 0) sec = 1800;
+      var u = schedUnitFor(sec);
+      var en = $('.sched-en', row), num = $('.sched-num', row), un = $('.sched-unit', row);
+      if (en) en.checked = String(st['aprs_' + it.st + '_enabled']) === '1';
+      if (num) num.value = u.value;
+      if (un) un.value = u.unit;
+    });
+    schedLoaded = true;
+    schedNext(schedLastNext);
+  }
+
+  // 每轮状态刷新时更新各行的「下次发射」
+  function schedNext(nx) {
+    schedLastNext = nx || {};
+    var now = Date.now() / 1000;
+    SCHED_ITEMS.forEach(function (it) {
+      var row = schedRowFor(it.pt);
+      if (!row) return;
+      var cell = $('.sched-now', row), en = $('.sched-en', row);
+      if (!cell) return;
+      if (en && !en.checked) { cell.textContent = '未启用'; return; }
+      var t = schedLastNext[it.pt];
+      if (t == null) { cell.textContent = '待排期'; return; }
+      var left = t - now;
+      cell.textContent = left > 0 ? ('下次 ' + fmtDur(left) + '后') : '即将发射';
+    });
+  }
+
+  function schedCollect() {
+    var body = {}, bad = [];
+    SCHED_ITEMS.forEach(function (it) {
+      var row = schedRowFor(it.pt);
+      if (!row) return;
+      var en = $('.sched-en', row);
+      var on = !!(en && en.checked);
+      body['aprs_' + it.st + '_enabled'] = on ? '1' : '0';
+      var num = $('.sched-num', row), un = $('.sched-unit', row);
+      var v = parseFloat(num && num.value);
+      var mult = parseInt(un && un.value, 10) || 60;
+      if (!isFinite(v) || v <= 0) {
+        if (on) bad.push(it.label + ' 间隔需为正数');
+        return;
+      }
+      var sec = Math.round(v * mult);
+      if (sec < 60 || sec > 86400) {
+        bad.push(it.label + ' 间隔需在 60 秒 ~ 24 小时');
+        return;
+      }
+      body['aprs_' + it.st + '_interval'] = String(sec);
+    });
+    return { body: body, bad: bad };
+  }
+
+  function schedSave() {
+    var res = $('#tx-sched-result');
+    if (!res) return;
+    var c = schedCollect();
+    if (c.bad.length) {
+      res.textContent = c.bad.join('；');
+      toast(c.bad[0], 'err');
+      return;
+    }
+    res.textContent = '正在保存…';
+    api('/api/settings', { method: 'POST', body: JSON.stringify(c.body) }).then(function (r) {
+      if (r && r.ok !== false) {
+        res.textContent = '已保存';
+        toast('定时发射计划已保存', 'ok');
+        schedLoaded = false;
+        loadStatus();
+      } else {
+        res.textContent = '保存失败：' + ((r && r.error) || '');
+        toast('保存失败', 'err');
+      }
+    }).catch(function (e) {
+      res.textContent = '请求异常：' + e;
+      toast('保存失败', 'err');
+    });
+  }
+
+  // 全开/全关只改勾选状态，需再点「保存发射计划」才落盘（避免误触发发射）
+  function schedAll(on) {
+    schedRows().forEach(function (row) {
+      var en = $('.sched-en', row);
+      if (en) en.checked = !!on;
+    });
+    var res = $('#tx-sched-result');
+    if (res) res.textContent = (on ? '已勾选全部项目' : '已取消全部项目') + '，点「保存发射计划」生效';
+    schedNext(schedLastNext);
+  }
+
   /* ================= 启动 ================= */
   function boot() {
+    if (window.APP_ROLE === 'admin') {
+      var sbox = $('#tx-sched-edit');
+      if (sbox) sbox.hidden = false;
+    }
     initMap();
     bind();
     loadStatus(); loadList(true); loadGeo(); loadTxLog();
-    setInterval(function () {
-      loadStatus();
-      if ($('#aprs-live').checked) loadList(false);
+    // 不重叠轮询：上一次返回之后才排下一次（见 static/js/poll.js）
+    ELF2Poll.loop(function () {
+      var p = loadStatus();
+      if ($('#aprs-live').checked) return Promise.all([p, loadList(false)]);
+      return p;
     }, 4000);
-    setInterval(function () {
-      if ($('#aprs-live').checked) loadGeo();
+    ELF2Poll.loop(function () {
+      if ($('#aprs-live').checked) return loadGeo();
     }, 15000);
     console.log('[APRS] ready');
   }

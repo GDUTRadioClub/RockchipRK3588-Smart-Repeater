@@ -142,6 +142,28 @@ input, select, textarea { margin-bottom: 2px; }
 .toast.error { border-left-color: var(--red); }
 .toast.success { border-left-color: var(--green); }
 .cal-row { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+/* 每卡片保存按钮旁的「有未保存的修改」提示 */
+.muted.small.dirty { color: #f5a623; opacity: 1; }
+
+/* ---------- 设置页分类收纳（原生 details） ---------- */
+details.acc {
+  margin: 0 0 14px; border: 1px solid var(--border); border-radius: 10px;
+  background: rgba(255, 255, 255, .02); overflow: hidden;
+}
+details.acc > summary {
+  cursor: pointer; padding: 11px 14px; display: flex; flex-wrap: wrap;
+  align-items: baseline; gap: 10px; user-select: none;
+  background: rgba(255, 255, 255, .03);
+  border-left: 3px solid var(--primary);
+}
+details.acc > summary::-webkit-details-marker { display: none; }
+details.acc > summary::after { content: '▾ 收起'; margin-left: auto; font-size: 12px; opacity: .55; }
+details.acc:not([open]) > summary::after { content: '▸ 展开'; }
+details.acc > summary:hover { background: rgba(255, 255, 255, .07); }
+details.acc > summary b { font-size: 14px; }
+details.acc .acc-sub { font-size: 12px; opacity: .6; }
+details.acc > *:not(summary) { padding-left: 14px; padding-right: 14px; }
+details.acc > *:not(summary):last-child { padding-bottom: 14px; }
 
 @media (max-width: 980px) {
   .grid-3, .grid-2 { grid-template-columns: 1fr; }

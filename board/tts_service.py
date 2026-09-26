@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """端侧 TTS 服务辅助模块：Piper 本地合成 + OpenAI 兼容外部语音 API。"""
+import atexit
 import json
 import logging
 import os
@@ -8,6 +9,7 @@ import re
 import shutil
 import subprocess
 import tempfile
+import threading
 import time
 import zipfile
 from pathlib import Path
@@ -22,11 +24,10 @@ PIPER_ESPEAK = PIPER_DIR / 'espeak-ng-data'
 VOICES_DIR = Path('/opt/ai/voices')
 PROTECTED_VOICES = {'zh_CN-huayan-medium'}   # 内置基座音色，禁止删除
 TTS_CACHE_DIR = Path('/www/tts_cache')
-TRAINING_DIR = Path('/opt/ai/voice_training')
 
 
 def ensure_dirs():
-    for p in (VOICES_DIR, TTS_CACHE_DIR, TRAINING_DIR):
+    for p in (VOICES_DIR, TTS_CACHE_DIR):
         p.mkdir(parents=True, exist_ok=True)
 
 
@@ -121,6 +122,151 @@ def list_voices():
     return voices
 
 
+# ---------------------------------------------------------------------------
+# 常驻 piper：模型只加载一次，之后从 stdin 逐行合成
+#
+# 为什么需要：piper_speak() 走的是 subprocess.run()，每次调用都要重新加载 61MB 的
+# ONNX 模型。实测单次约 0.9~1.0s，而测试文本只有 9 个字符——也就是说这 1 秒几乎
+# 全是进程启动 + 模型加载，不是推理。一句中英混读 + 呼号会被切成 7 段，于是
+# 7 × 0.9s ≈ 6s；而 LLM 首字 1.46s、7.8 字/秒，3s 就写完了，朗读必然越落越远。
+#
+# 做法：每个音色保持一个常驻 piper，用 --output_dir 模式逐行喂文本。
+# piper 的输出文件名由它自己决定（各版本不一），所以这里不猜命名，而是
+# 「记住喂入前目录里各 wav 的 mtime → 等出现更新的文件 → 等文件大小稳定」，
+# 对版本差异免疫，也不怕它复用同一个文件名。
+# 任何一步失败都回退到原来的冷启动路径，绝不会比以前更慢。
+# 可用环境变量关闭：RELAY_WARM_PIPER=0
+# ---------------------------------------------------------------------------
+WARM_PIPER = os.environ.get('RELAY_WARM_PIPER', '1').lower() not in ('0', 'false', 'no', 'off')
+WARM_PIPER_TIMEOUT = float(os.environ.get('RELAY_WARM_PIPER_TIMEOUT', '30'))
+
+_warm_lock = threading.RLock()
+_warm_procs = {}      # voice_id -> _WarmPiper
+_warm_failed = set()  # 连续失败的音色：此后一律走冷启动
+_warm_fails = {}      # voice_id -> 连续失败次数
+
+
+def _wav_mtimes(d):
+    out = {}
+    try:
+        for name in os.listdir(d):
+            if name.endswith('.wav'):
+                try:
+                    out[name] = os.path.getmtime(os.path.join(d, name))
+                except OSError:
+                    pass
+    except OSError:
+        pass
+    return out
+
+
+class _WarmPiper:
+    """一个音色一个常驻 piper 进程；输出文件名靠目录变化探测，不猜命名。"""
+
+    def __init__(self, voice_id, model, config):
+        self.voice_id = voice_id
+        self.dir = Path(tempfile.mkdtemp(prefix='piper_warm_'))
+        env = os.environ.copy()
+        env['LD_LIBRARY_PATH'] = str(PIPER_DIR) + (
+            ':' + env.get('LD_LIBRARY_PATH', '') if env.get('LD_LIBRARY_PATH') else '')
+        self.proc = subprocess.Popen(
+            [str(PIPER_BIN), '--model', str(model), '--config', str(config),
+             '--output_dir', str(self.dir), '--espeak_data', str(PIPER_ESPEAK), '--quiet'],
+            stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL, cwd=str(PIPER_DIR), env=env)
+
+    def alive(self):
+        return self.proc.poll() is None
+
+    def speak(self, text):
+        if not self.alive():
+            raise RuntimeError('常驻 piper 已退出')
+        payload = ' '.join(str(text).splitlines()).strip()
+        if not payload:
+            raise ValueError('空文本')
+        before = _wav_mtimes(self.dir)
+        self.proc.stdin.write((payload + '\n').encode('utf-8'))
+        self.proc.stdin.flush()
+        deadline = time.time() + WARM_PIPER_TIMEOUT
+        target = None
+        while time.time() < deadline:
+            if not self.alive():
+                raise RuntimeError('常驻 piper 在合成中退出')
+            newest = None
+            for name, mt in _wav_mtimes(self.dir).items():
+                old = before.get(name)
+                if old is None or mt > old + 1e-6:
+                    if newest is None or mt > newest[1]:
+                        newest = (name, mt)
+            if newest:
+                target = self.dir / newest[0]
+                break
+            time.sleep(0.02)
+        if target is None:
+            raise TimeoutError('等待 piper 输出超时')
+        # 等文件大小稳定，避免把半截 WAV 拿出去播
+        last = -1
+        for _ in range(400):
+            try:
+                size = target.stat().st_size
+            except OSError:
+                size = -1
+            if size > 44 and size == last:
+                break
+            last = size
+            time.sleep(0.02)
+        return target
+
+    def close(self):
+        try:
+            if self.proc.poll() is None:
+                try:
+                    self.proc.stdin.close()
+                except Exception:
+                    pass
+                try:
+                    self.proc.wait(timeout=3)
+                except Exception:
+                    self.proc.kill()
+        except Exception:
+            pass
+        try:
+            shutil.rmtree(str(self.dir), ignore_errors=True)
+        except Exception:
+            pass
+
+
+def _warm_speak(text, voice_id, model, config):
+    with _warm_lock:
+        wp = _warm_procs.get(voice_id)
+        if wp is None:
+            wp = _WarmPiper(voice_id, model, config)
+            _warm_procs[voice_id] = wp
+        try:
+            path = wp.speak(text)
+            _warm_fails.pop(voice_id, None)
+            return path
+        except Exception:
+            wp.close()
+            _warm_procs.pop(voice_id, None)
+            n = _warm_fails.get(voice_id, 0) + 1
+            _warm_fails[voice_id] = n
+            if n >= 2:
+                _warm_failed.add(voice_id)
+                log.warning('常驻 piper 连续失败 %d 次，%s 改为冷启动', n, voice_id)
+            raise
+
+
+def close_warm_pipers():
+    with _warm_lock:
+        for wp in list(_warm_procs.values()):
+            wp.close()
+        _warm_procs.clear()
+
+
+atexit.register(close_warm_pipers)
+
+
 def piper_speak(text, voice_id, out_path):
     voice_id = safe_name(voice_id)
     voice_dir = VOICES_DIR / voice_id
@@ -132,6 +278,20 @@ def piper_speak(text, voice_id, out_path):
         raise FileNotFoundError(f'本地音色包不完整：{voice_id}')
     if not PIPER_BIN.exists():
         raise FileNotFoundError(f'Piper 未安装：{PIPER_BIN}')
+
+    # 优先走常驻进程（省掉每次约 1s 的模型加载）；任何异常都回退下面的冷启动
+    if WARM_PIPER and voice_id not in _warm_failed:
+        try:
+            warm_path = _warm_speak(text, voice_id, model, config)
+            shutil.copyfile(str(warm_path), str(out_path))
+            try:
+                os.remove(str(warm_path))
+            except OSError:
+                pass
+            return str(out_path)
+        except Exception as e:
+            log.warning('常驻 piper 不可用（%s），本次回退冷启动：%s', voice_id, e)
+
     env = os.environ.copy()
     env['LD_LIBRARY_PATH'] = str(PIPER_DIR) + (':' + env.get('LD_LIBRARY_PATH', '') if env.get('LD_LIBRARY_PATH') else '')
     cmd = [
@@ -312,6 +472,42 @@ def _split_marked(text):
     return segs
 
 
+def _has_speakable(s):
+    """是否含真正要发音的字符。纯标点/空白段不值得单起一次 piper（约 1s）。"""
+    for ch in s or '':
+        if ch.isalnum() or '\u4e00' <= ch <= '\u9fff':
+            return True
+    return False
+
+
+def _coalesce_segments(segs, voice_of):
+    """合并退化片段，减少 piper 调用次数。
+
+    实测：一句话被切成 7 段时整段合成要 6s，几乎全是 piper 的模型加载开销，
+    所以「少切一段」就等于「少一次约 1s」。这里做两件事：
+      1) 纯标点/空白段并入相邻段——原来连一个逗号「，」都会单独起一次 piper；
+      2) 解析后音色相同的相邻段合并成一段（拼起来交给 piper，韵律不受影响）。
+    """
+    out = []
+    for kind, seg in segs:
+        seg = (seg or '').strip()
+        if not seg:
+            continue
+        if not _has_speakable(seg):
+            if out:
+                out[-1] = (out[-1][0], out[-1][1] + seg)
+                continue
+        elif out and voice_of(out[-1][0]) == voice_of(kind):
+            out[-1] = (out[-1][0], out[-1][1] + seg)
+            continue
+        out.append((kind, seg))
+    # 开头若是纯标点段，并到后一段
+    if len(out) > 1 and not _has_speakable(out[0][1]):
+        out[1] = (out[1][0], out[0][1] + out[1][1])
+        out.pop(0)
+    return out
+
+
 def synthesize_multilingual(text, zh_voice, en_voice=None, icao=False, aviation_digits=False,
                             icao_voice=None):
     """中英混读：按语言分段，各自用对应音色合成后拼接。
@@ -329,19 +525,21 @@ def synthesize_multilingual(text, zh_voice, en_voice=None, icao=False, aviation_
         text = expand_icao(text, aviation_digits=aviation_digits, mark=True)
     en_voice = en_voice or pick_english_voice()
     icao_voice = icao_voice or pick_icao_voice()
-    segs = _split_marked(text)
+    def _voice_of(kind):
+        if kind == 'zh':
+            return zh_voice
+        if kind == 'icao':
+            return icao_voice or en_voice or zh_voice
+        return en_voice or zh_voice
+
+    segs = _coalesce_segments(_split_marked(text), _voice_of)
     if not segs:
         raise ValueError('没有可合成的片段')
     out_path = TTS_CACHE_DIR / f'tts_{time.strftime("%Y%m%d_%H%M%S")}_{os.getpid()}.wav'
     parts = []
     used = []
     for kind, seg in segs:
-        if kind == 'zh':
-            voice = zh_voice
-        elif kind == 'icao':
-            voice = icao_voice or en_voice or zh_voice
-        else:
-            voice = en_voice or zh_voice
+        voice = _voice_of(kind)
         p = TTS_CACHE_DIR / f'seg_{time.strftime("%H%M%S")}_{len(parts)}_{os.getpid()}.wav'
         piper_speak(seg, voice, p)
         parts.append(p)
@@ -452,27 +650,3 @@ def _sanitize_voice_config(config_path):
         pass
     Path(config_path).write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding='utf-8')
     return bad
-
-
-def save_training_zip(zip_stream, dataset_id):
-    dataset_id = safe_name(dataset_id, 'dataset')
-    target = TRAINING_DIR / dataset_id
-    target.mkdir(parents=True, exist_ok=True)
-    extract_zip_safely(zip_stream, target)
-    mark = target / 'UPLOAD_INFO.txt'
-    mark.write_text(
-        f'上传时间：{time.strftime("%Y-%m-%d %H:%M:%S")}\n'
-        '说明：RK3588 板端不直接进行神经网络 TTS 训练。\n'
-        '建议在 PC/服务器上使用 Piper 训练流程或 GPT-SoVITS 等方案完成微调，\n'
-        '导出为 Piper ONNX 音色包后，通过“上传音色包”部署到 /opt/ai/voices。\n',
-        encoding='utf-8')
-    return {'dataset_id': dataset_id, 'path': str(target)}
-
-
-def list_training_jobs():
-    ensure_dirs()
-    jobs = []
-    for d in sorted(TRAINING_DIR.iterdir()):
-        if d.is_dir():
-            jobs.append({'id': d.name, 'path': str(d), 'mtime': d.stat().st_mtime})
-    return jobs

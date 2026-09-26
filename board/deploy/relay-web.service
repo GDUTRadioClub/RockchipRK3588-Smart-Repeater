@@ -12,6 +12,22 @@ Environment=RELAY_WEB_PORT=8080
 Environment=RELAY_AUDIO_DEVICE=plughw:CARD=rockchipnau8822,DEV=0
 Environment=RELAY_PTT_GPIO=97
 Environment=RELAY_PTT_ACTIVE_HIGH=1
+# 有界并发：app.py 优先用 waitress（有界线程池）；没装 waitress 时退回
+# Werkzeug + 信号量阀。无论哪条路径，同时进入 Flask 的请求数都被限住，
+# 避免前端轮询一重叠就把积压变成几百个线程、把 GIL 抢死。
+Environment=RELAY_WEB_THREADS=16
+# 排队等待上限（秒），超过直接回 503。仅 Werkzeug 回退路径使用。
+Environment=RELAY_WEB_QUEUE_TIMEOUT=30
+# auto=优先 waitress（未装则回退 Werkzeug+信号量阀）；
+# 若 waitress 在某场景有问题，改成 werkzeug 可强制回退。
+Environment=RELAY_WEB_SERVER=auto
+# 摄像头 H.264 编码器：不设=自动探测（先试编一帧，失败自动退回 libx264）。
+# RELAY_CAM_HWENC=0 强制软件编码；RELAY_CAM_ENCODER=h264_rkmpp 直接指定。
+# 软件 libx264 常驻编码实测吃掉约 0.8 个核，值得用硬件编码器换回来。
+Environment=RELAY_CAM_HWENC=1
+# 硬件编码码率。rkmpp/v4l2m2m 不支持 -crf，只能走码率：默认 1500k 是标定到
+# 与原先 libx264 -crf 30 相当的体积（720p15 约 11MB/分钟）。调大即体积翻倍。
+Environment=RELAY_CAM_BITRATE=1500k
 ExecStart=/usr/bin/python3 /www/app.py
 Restart=on-failure
 RestartSec=3

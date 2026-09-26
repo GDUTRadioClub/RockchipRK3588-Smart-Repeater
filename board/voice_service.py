@@ -325,6 +325,20 @@ class Store:
                         c.execute('ALTER TABLE voice_logs ADD COLUMN %s TEXT' % col)
                     except Exception:
                         pass
+                # 段内 APRS 位置标记。经纬度必须是 REAL：统一按 TEXT 加列会把
+                # 22.5333 存成字符串，后面算距离就得处处 float() 兜底。
+                for col, typ in (('aprs_call', 'TEXT'), ('aprs_lat', 'REAL'),
+                                 ('aprs_lon', 'REAL'),
+                                 ('aprs_pos', 'INTEGER DEFAULT 0')):
+                    try:
+                        c.execute('ALTER TABLE voice_logs ADD COLUMN %s %s' % (col, typ))
+                    except Exception:
+                        pass
+                try:
+                    c.execute('CREATE INDEX IF NOT EXISTS idx_voice_aprs '
+                              'ON voice_logs(aprs_pos, aprs_call)')
+                except Exception:
+                    pass
                 c.commit()
             finally:
                 c.close()
@@ -765,14 +779,21 @@ class Recorder:
                 float(self.svc.counters.get('jitter_seconds', 0.0)) + seconds, 1)
             self.stats['segments'] += 1
             return
+        # 段内 APRS 位置标记：录完就判一次，不依赖 ASR（关掉 ASR 也要能标记）。
+        # 尾音信标通常在本段录音窗口内先解出来，所以这里多数情况已经能命中；
+        # ASR 之后还会再刷一次，兜住「解包比收段慢一点」的竞态。
+        pos, pcall, plat, plon = self.svc._fill_aprs_pos(
+            seg.start_ts, seconds, seg.kind)
         rid = self.svc.store.exec(
             'INSERT INTO voice_logs(ts,ts_epoch,end_epoch,session_id,seq,kind,category,'
-            'seconds,rms,peak,dbfs,filename,path,bytes,asr_status,created) '
-            'VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
+            'seconds,rms,peak,dbfs,filename,path,bytes,asr_status,created,'
+            'aprs_pos,aprs_call,aprs_lat,aprs_lon) '
+            'VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
             (datetime.fromtimestamp(seg.start_ts).astimezone().isoformat(timespec='seconds'),
              seg.start_ts, ts, self.session_id, seg.seq, seg.kind, category,
              round(seconds, 2), round(rms, 1), seg.peak, round(dbfs, 1),
-             Path(seg.path).name, str(seg.path), size, 'pending', _now_iso()))
+             Path(seg.path).name, str(seg.path), size, 'pending', _now_iso(),
+             pos, pcall, plat, plon))
         self.stats['segments'] += 1
         self.stats['seconds'] = round(float(self.stats['seconds']) + seconds, 1)
         self.svc.counters['segments'] = int(self.svc.counters.get('segments', 0)) + 1
@@ -1046,6 +1067,11 @@ class VoiceService:
         self.started_at = time.time()
         self._threads_started = False
         self.started = False
+        # 目录用量扫描是 O(文件数)，而 status() 被前端每 3s 轮询一次：
+        # 加一层短 TTL 缓存，避免反复遍历整个语音日志目录。
+        self._usage_lock = threading.Lock()
+        self._usage_cache = None
+        self._usage_ttl = 15.0
 
     # -- 配置/依赖注入 -----------------------------------------------------
     def configure(self, get_rx, get_tx, provider_config, setting_getter=None,
@@ -1204,14 +1230,22 @@ class VoiceService:
         status = 'done' if _flag(st.get('vlog_asr_enabled'), True) else 'disabled'
         if category in ('jitter', 'silence'):
             status = 'skip'
+        # 再刷一次位置标记：解包可能比收段慢一拍，落段时那次没命中，这里补上。
+        # 只增不减——已经有标记的段不因为这次没查到就被抹掉。
+        pos, pcall, plat, plon = self._fill_aprs_pos(
+            row.get('ts_epoch'), row.get('seconds'), row.get('kind') or '')
+        if not pos and (row.get('aprs_pos') or 0):
+            pos, pcall, plat, plon = (row.get('aprs_pos'), row.get('aprs_call'),
+                                      row.get('aprs_lat'), row.get('aprs_lon'))
         self.store.exec(
             'UPDATE voice_logs SET category=?, asr_status=?, asr_text=?, asr_json=?, '
             'asr_ms=?, rtf=?, feature_json=?, rms=?, peak=?, dbfs=?, '
-            'callsigns=?, callsigns_raw=? WHERE id=?',
+            'callsigns=?, callsigns_raw=?, aprs_pos=?, aprs_call=?, aprs_lat=?, '
+            'aprs_lon=? WHERE id=?',
             (category, status, text or '', json.dumps(texts, ensure_ascii=False) if texts else '',
              asr_ms, rtf, json.dumps(feat, ensure_ascii=False),
              feat['rms'], feat['peak'], feat['dbfs'], ','.join(calls),
-             ','.join(raw_calls), rid))
+             ','.join(raw_calls), pos, pcall, plat, plon, rid))
         self.counters['asr_done'] = int(self.counters.get('asr_done', 0)) + 1
         self.asr_last = {'id': rid, 'category': category, 'seconds': feat['seconds'],
                          'ms': asr_ms, 'rtf': rtf, 'text': text[:80],
@@ -1224,17 +1258,20 @@ class VoiceService:
         """对历史记录重跑 APRS 时间交叉判定，修正被削顶带偏的分类。
 
         只做「改成 aprs」或「从 aprs 改回启发式结果」，不重跑 ASR，代价极低。
+
+        顺带**回填位置标记**：这一步要覆盖**有识别文字的段**——「人说话 + 尾音
+        带位置信标」正是它的主体，而下面的分类循环会 continue 掉这些段。
         """
+        cols = ('id,category,kind,ts_epoch,seconds,asr_text,path,feature_json,'
+                'aprs_pos,aprs_call')
         base = self.store.query(
-            'SELECT id,category,kind,ts_epoch,seconds,asr_text,path,feature_json '
-            'FROM voice_logs WHERE substr(ts,1,10)=? OR ? IS NULL',
+            'SELECT %s FROM voice_logs WHERE substr(ts,1,10)=? OR ? IS NULL' % cols,
             (day or '', day)) if day else self.store.query(
-            'SELECT id,category,kind,ts_epoch,seconds,asr_text,path,feature_json '
-            'FROM voice_logs')
+            'SELECT %s FROM voice_logs' % cols)
         changed = []
         for r in base:
             if (r.get('asr_text') or '').strip():
-                continue                       # 有识别文字的是语音，不动
+                continue                       # 有识别文字的是语音，不动分类
             hit = self._aprs_overlap(r.get('ts_epoch'), r.get('seconds'),
                                      r.get('kind') or '')
             old = r.get('category') or ''
@@ -1242,9 +1279,25 @@ class VoiceService:
                 changed.append((r['id'], old, 'aprs'))
             elif (not hit) and old == 'aprs':
                 changed.append((r['id'], old, 'tone'))
+        pos_n = 0
+        for r in base:
+            pos, pcall, plat, plon = self._fill_aprs_pos(
+                r.get('ts_epoch'), r.get('seconds'), r.get('kind') or '')
+            if not pos:
+                continue
+            if int(r.get('aprs_pos') or 0) and (r.get('aprs_call') or '') == pcall:
+                continue                       # 已经标好且没变，不用写
+            pos_n += 1
+            if not dry:
+                self.store.exec(
+                    'UPDATE voice_logs SET aprs_pos=?,aprs_call=?,aprs_lat=?,'
+                    'aprs_lon=? WHERE id=?', (pos, pcall, plat, plon, r['id']))
         if not dry:
             for rid, _old, new in changed:
                 self.store.exec('UPDATE voice_logs SET category=? WHERE id=?', (new, rid))
+        if pos_n:
+            print('%s 位置标记%s：%d 段' % (LOG, '预演' if dry else '完成', pos_n),
+                  flush=True)
         return changed
 
     def retranscribe(self, rid):
@@ -1522,10 +1575,13 @@ class VoiceService:
             return {'ok': False, 'error': err}
 
     # -- 查询接口 ----------------------------------------------------------
-    def list_logs(self, day=None, category=None, kind=None, q=None, limit=200, offset=0):
+    def list_logs(self, day=None, category=None, kind=None, q=None, pos=None,
+                  limit=200, offset=0):
+        """pos: 'only' 只看含 APRS 位置的段 / 'none' 只看不含的 / None 不过滤。"""
         sql = 'SELECT id,ts,ts_epoch,seconds,kind,category,rms,peak,dbfs,filename,path,' \
               'bytes,asr_status,asr_text,asr_json,asr_ms,rtf,session_id,seq,feature_json,' \
-              'callsigns,callsigns_raw FROM voice_logs WHERE 1=1'
+              'callsigns,callsigns_raw,aprs_pos,aprs_call,aprs_lat,aprs_lon ' \
+              'FROM voice_logs WHERE 1=1'
         args = []
         if day:
             sql += ' AND substr(ts,1,10)=?'
@@ -1541,9 +1597,14 @@ class VoiceService:
         if kind:
             sql += ' AND kind=?'
             args.append(kind)
+        if pos == 'only':
+            sql += ' AND IFNULL(aprs_pos,0)=1'
+        elif pos == 'none':
+            sql += ' AND IFNULL(aprs_pos,0)=0'
         if q:
-            sql += ' AND (asr_text LIKE ? OR filename LIKE ? OR callsigns LIKE ?)'
-            args += ['%%%s%%' % q, '%%%s%%' % q, '%%%s%%' % q]
+            sql += (' AND (asr_text LIKE ? OR filename LIKE ? OR callsigns LIKE ?'
+                    ' OR aprs_call LIKE ?)')
+            args += ['%%%s%%' % q] * 4
         sql += ' ORDER BY ts_epoch DESC LIMIT ? OFFSET ?'
         args += [int(limit), int(offset)]
         rows = self.store.query(sql, args)
@@ -1568,6 +1629,11 @@ class VoiceService:
                 'callsigns': (r.get('callsigns') or '').split(',') if r.get('callsigns') else [],
                 'callsigns_raw': (r.get('callsigns_raw') or '').split(',')
                                  if r.get('callsigns_raw') else [],
+                # 段内 APRS 位置：尾音里解出的对方信标（呼号 + 坐标）
+                'aprs_pos': bool(r.get('aprs_pos') or 0),
+                'aprs_call': r.get('aprs_call') or '',
+                'aprs_lat': r.get('aprs_lat'),
+                'aprs_lon': r.get('aprs_lon'),
             })
         return out
 
@@ -1579,11 +1645,13 @@ class VoiceService:
         stats = {r['category'] or 'pending': {'n': r['n'], 'sec': round(float(r['sec'] or 0), 1)}
                  for r in rows}
         tot = self.store.one(
-            'SELECT COUNT(*) AS n, SUM(seconds) AS sec, SUM(bytes) AS b FROM voice_logs '
-            'WHERE substr(ts,1,10)=?', (day,)) or {}
+            'SELECT COUNT(*) AS n, SUM(seconds) AS sec, SUM(bytes) AS b,'
+            ' SUM(CASE WHEN IFNULL(aprs_pos,0)=1 THEN 1 ELSE 0 END) AS pos'
+            ' FROM voice_logs WHERE substr(ts,1,10)=?', (day,)) or {}
         return {'day': day, 'categories': stats, 'total': int(tot.get('n') or 0),
                 'seconds': round(float(tot.get('sec') or 0.0), 1),
-                'bytes': int(tot.get('b') or 0)}
+                'bytes': int(tot.get('b') or 0),
+                'aprs_pos': int(tot.get('pos') or 0)}
 
     def peaks(self, rid, n=600):
         row = self.store.one('SELECT path FROM voice_logs WHERE id=?', (rid,))
@@ -1665,9 +1733,88 @@ class VoiceService:
             pass
         return ''
 
-    def status(self):
-        st = self.settings()
-        base = Path(st.get('vlog_dir') or DEFAULTS['vlog_dir'])
+    def _aprs_position_hit(self, ts_epoch, seconds, kind=''):
+        """找与本段重叠的**位置**报文（带经纬度），返回 dict 或 None。
+
+        与 _aprs_overlap 共用同一套时间窗，理由是实测证据：APRS 爆发紧跟话音
+        尾部、落在**同一段录音内**（#51 落在 8.72s / 录音长 11.25s）。
+
+        与 _aprs_overlap 的关键区别：
+          * 只认带 lat/lon 的包——状态包、遥测包带不来位置，标记它们没意义；
+          * **不要求本段没有识别文字**。「人说话 + 尾音带位置信标」正是要标记的
+            对象，而 _aprs_overlap 因为 text 优先，永远不会碰这种段。
+
+        本机发射（kind='tx'）不算：那是我们自己的信标；同理排除本站呼号，
+        否则自收听会把每个 tx 段都标成「含对方位置」。
+        """
+        if kind == 'tx':
+            return None
+        try:
+            t0 = float(ts_epoch)
+        except (TypeError, ValueError):
+            return None
+        if not t0:
+            return None
+        t1 = t0 + max(1.0, float(seconds or 0)) + 0.5
+        t0 -= 0.5
+        # 本站自己的呼号要在 SQL 里就排掉，不能取回一条再判断：只取 1 条的话，
+        # 本机信标会把同一时刻用户的那一条顶掉，于是整段判成「没有位置」。
+        # 只排**精确**呼号（mycall 与 mycall-ssid）——同一操作者的其它 SSID
+        # （BI7KHI-9）往往就是用户手上那台，按主呼号排会把它一起误伤。
+        mine = []
+        try:
+            st = self.settings() or {}
+            my = str(st.get('aprs_mycall') or '').strip().upper()
+            ssid = str(st.get('aprs_ssid') or '').strip()
+            if my:
+                mine.append(my)
+                if ssid not in ('', '0'):
+                    mine.append('%s-%s' % (my, ssid))
+        except Exception:
+            mine = []
+        sql = ('SELECT id,src,lat,lon FROM aprs_packets '
+               'WHERE ts_epoch BETWEEN ? AND ? AND lat IS NOT NULL '
+               'AND lon IS NOT NULL')
+        args = [t0, t1]
+        if mine:
+            sql += (" AND UPPER(IFNULL(src,'')) NOT IN (%s)"
+                    % ','.join('?' * len(mine)))
+            args += mine
+        sql += ' ORDER BY ts_epoch DESC LIMIT 1'
+        try:
+            row = self.store.one(sql, tuple(args))
+        except Exception:
+            return None
+        if not row:
+            return None
+        return {'id': row.get('id'),
+                'call': str(row.get('src') or '').strip(),
+                'lat': row.get('lat'), 'lon': row.get('lon')}
+
+    def _fill_aprs_pos(self, ts_epoch, seconds, kind=''):
+        """给一段算出位置标记，返回可直接 UPDATE 的四个值。"""
+        hit = self._aprs_position_hit(ts_epoch, seconds, kind)
+        if not hit:
+            return (0, None, None, None)
+        try:
+            lat = round(float(hit['lat']), 5)
+            lon = round(float(hit['lon']), 5)
+        except (TypeError, ValueError):
+            return (0, None, None, None)
+        return (1, hit.get('call') or '', lat, lon)
+
+    def _dir_usage(self, base):
+        """统计目录下 .wav 的数量与总大小（带短 TTL 缓存）。
+
+        这是 O(文件数) 的递归遍历，而 status() 会被前端每 3s 轮询一次。
+        缓存 15s：对轮询来说足够新，又把重复扫描降一个数量级。
+        """
+        key = str(base)
+        now = time.time()
+        with self._usage_lock:
+            c = self._usage_cache
+            if c and c[0] == key and (now - c[1]) < self._usage_ttl:
+                return c[2], c[3]
         size_mb = 0.0
         files = 0
         try:
@@ -1680,6 +1827,14 @@ class VoiceService:
                         pass
         except Exception:
             pass
+        with self._usage_lock:
+            self._usage_cache = (key, now, size_mb, files)
+        return size_mb, files
+
+    def status(self):
+        st = self.settings()
+        base = Path(st.get('vlog_dir') or DEFAULTS['vlog_dir'])
+        size_mb, files = self._dir_usage(base)
         rec = self.recorder
         today = datetime.now().strftime('%Y-%m-%d')
         recent = self.store.query(

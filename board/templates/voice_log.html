@@ -7,7 +7,7 @@
 {% endblock %}
 
 {% block head_extra %}
-<link rel="stylesheet" href="{{ url_for('static', filename='css/voice-log.css', v='20260924a') }}">
+<link rel="stylesheet" href="{{ url_for('static', filename='css/voice-log.css', v='20260930c') }}">
 {% endblock %}
 
 {% block content %}
@@ -68,10 +68,26 @@
     </div>
   </div>
   <div class="vlog-timeline" id="vlog-timeline">
-    <div class="vlog-tl-axis">
+    <div class="vlog-tl-axis" id="vlog-tl-axis">
       <span>00</span><span>06</span><span>12</span><span>18</span><span>24</span>
     </div>
     <div class="vlog-tl-track" id="vlog-tl-track"></div>
+
+    <!-- 总览条：始终显示全天分布，双滑块在这里选区间（缩放主时间轴） -->
+    <div class="vlog-tl-brush" id="vlog-tl-brush" title="拖动两端滑块缩放时间轴；拖动中间平移；双击重置为全天">
+      <div class="vlog-tl-brush-bg" id="vlog-tl-brush-bg"></div>
+      <div class="vlog-tl-brush-sel" id="vlog-tl-brush-sel">
+        <span class="vlog-tl-handle" data-h="a" tabindex="0" role="slider"
+              aria-label="区间起点" aria-valuemin="0" aria-valuemax="86400"></span>
+        <span class="vlog-tl-handle" data-h="b" tabindex="0" role="slider"
+              aria-label="区间终点" aria-valuemin="0" aria-valuemax="86400"></span>
+      </div>
+    </div>
+    <div class="vlog-tl-brushrow">
+      <span class="muted small" id="vlog-tl-range">全天</span>
+      <button class="btn ghost btn-sm" id="btn-tl-reset" hidden>重置为全天</button>
+      <span class="muted small" id="vlog-tl-hint">拖动总览条两端滑块可缩放</span>
+    </div>
   </div>
 </div>
 
@@ -96,7 +112,12 @@
           <option value="tx">本机发射</option>
           <option value="both">收发同时</option>
         </select>
-        <input id="vlog-q" placeholder="搜索识别文字…" class="vlog-q">
+        <select id="vlog-pos" title="只看尾音里带 APRS 位置信标的段">
+          <option value="">位置：全部</option>
+          <option value="only">含 APRS 位置</option>
+          <option value="none">不含位置</option>
+        </select>
+        <input id="vlog-q" placeholder="搜索文字/呼号…" class="vlog-q">
         <button class="btn" id="btn-vlog-search">搜索</button>
       </div>
       <div class="row gap">
@@ -165,5 +186,5 @@
 
 {% block scripts %}
 <script>window.VLOG_CSRF = document.querySelector('meta[name="csrf-token"]')?.content || '';</script>
-<script src="{{ url_for('static', filename='js/voice-log.js', v='20260924a') }}"></script>
+<script src="{{ url_for('static', filename='js/voice-log.js', v='20260930c') }}"></script>
 {% endblock %}

@@ -1008,8 +1008,10 @@
     if (els.liveText) els.liveText.textContent = '实时预览中（MJPEG）';
     pollBusy();
     if (!liveState.timer) {
-      liveState.timer = setInterval(() => {
-        if (isCameraTabActive() && isLiveMode()) pollBusy();
+      // 不重叠轮询（见 static/js/poll.js）：原先 setInterval 不等返回，
+      // 板端变慢时会与其它轮询一起堆积
+      liveState.timer = ELF2Poll.loop(() => {
+        if (isCameraTabActive() && isLiveMode()) return pollBusy();
       }, 2000);
     }
   }
@@ -1314,15 +1316,14 @@
     window.addEventListener('elf2:camera-settings-saved', () => loadAll({ silent: true, keepPage: true }));
 
     // 轮询：仅在摄像头 Tab 可见时刷新存储；每 30 秒安静刷新分片
-    setInterval(() => {
-      if (isCameraTabActive()) loadStorageOnly();
+    // 一律走 ELF2Poll.loop：上一次返回之后才排下一次，不会重叠堆积（见 static/js/poll.js）
+    ELF2Poll.loop(() => {
+      if (isCameraTabActive()) return loadStorageOnly();
     }, 8000);
-    setInterval(() => {
-      maybeAutoPreview();
-    }, 3000);
-    setInterval(() => {
+    ELF2Poll.loop(maybeAutoPreview, 3000);
+    ELF2Poll.loop(() => {
       if (isCameraTabActive() && !state.dragging && !state.batchBusy) {
-        loadAll({ silent: true, keepPage: true });
+        return loadAll({ silent: true, keepPage: true });
       }
     }, 30000);
   }

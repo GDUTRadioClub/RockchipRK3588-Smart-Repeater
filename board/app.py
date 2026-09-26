@@ -52,6 +52,7 @@ import weather_service
 import voice_service
 import assistant_service
 import aprs_service
+import energy_service
 
 BASE_DIR = Path(__file__).resolve().parent
 DB_PATH = BASE_DIR / 'relay.db'
@@ -471,6 +472,10 @@ def _set_default_settings(db):
         'pv_adc_channel': str(ADC_CHANNELS['pv']['default_channel']),
         'pv_zero_raw': str(ADC_CHANNELS['pv']['default_zero']),
         'pv_multiplier': str(ADC_CHANNELS['pv']['default_multiplier']),
+        # 能量统计：电压此前不落库，全天时间轴靠这个采样器攒
+        'energy_log_enabled': '1',
+        'energy_sample_sec': '60',
+        'energy_retention_days': '365',
         'record_auto_play': '1',
         'site_title': 'ELF2 智能中继控制中心',
         # 提示词注入 / Agent 工具
@@ -506,7 +511,6 @@ def _set_default_settings(db):
         'assist_history_turns': '6',
         'assist_max_input_chars': '3000',
         'assist_temperature': '0.3',
-        'assist_provider': 'local',
         'assist_use_tools': '1',
         'assist_agent_iters': '2',
         'assist_keep_llm_warm': '1',
@@ -625,7 +629,15 @@ def _set_default_settings(db):
         'tts_en_voice': '',        # 英文片段使用的音色（空=自动挑 language 为 en 的音色）
         'tts_icao': '1',           # 呼号/单字母按 ICAO 字母解释法朗读
         'tts_icao_voice': '',      # ICAO 字母串专用音色（空=自动优先 lessac 等官方英文音色）
-        'tts_auto_speak': '0',
+        # 默认常开：LLM 流式输出时边出字边用 Piper 朗读。
+        # 这是「运行策略」而不是靠前端复选框——前端同步一旦失败就会静默关掉流式朗读。
+        'tts_auto_speak': '1',
+        # 定时重启计划：每天多个 HH:MM（逗号分隔），到点前先语音播报再重启。
+        # 重启走 /usr/local/sbin/elf2-reboot.sh 的 sudoers 白名单（见 board/deploy/）。
+        'reboot_enabled': '0',
+        'reboot_times': '',
+        'reboot_notice_sec': '30',
+        'reboot_text': '中继台即将重启，请稍候。',
     }
     for k, v in defaults.items():
         db.execute('INSERT OR IGNORE INTO settings(key, value) VALUES(?,?)', (k, v))
@@ -712,6 +724,17 @@ def init_db():
             ok INTEGER DEFAULT 1,
             note TEXT DEFAULT ''
         );
+        CREATE TABLE IF NOT EXISTS voltage_readings (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts TEXT NOT NULL,
+            ts_epoch REAL NOT NULL,
+            battery REAL,
+            pv REAL,
+            battery_raw INTEGER,
+            pv_raw INTEGER
+        );
+        CREATE INDEX IF NOT EXISTS idx_volt_ts_epoch ON voltage_readings(ts_epoch);
+        CREATE INDEX IF NOT EXISTS idx_volt_ts ON voltage_readings(ts);
         '''
     )
     db.execute('PRAGMA journal_mode=WAL')
@@ -887,8 +910,10 @@ def logout():
 @app.route('/')
 @login_required
 def index():
+    # tts_auto_speak 一并在首屏渲染：策略状态不依赖前端 JS 同步成功
     return render_template('dashboard.html', user=session.get('username'),
-                           role=session.get('role'))
+                           role=session.get('role'),
+                           tts_auto_speak=bool_setting('tts_auto_speak', True))
 
 
 # ---------------------------------------------------------------------------
@@ -1049,6 +1074,127 @@ def voltage_payload():
     return out
 
 
+# ---------------------------------------------------------------------------
+# 能量统计：电池/光伏电压采样落库 + 全日时间轴
+# ---------------------------------------------------------------------------
+# 电压此前**完全没落库**（voltage_payload 按需读 ADC、算完即弃），所以「全天
+# 时间轴」的前提是先攒数据；历史补不回来，图表从部署后开始积累。
+def _db_direct():
+    """后台线程/非请求路径用的直连。
+
+    get_db() 把连接挂在 Flask 的 g 上，脱离请求上下文就会炸，所以采样线程
+    必须自己开连接。
+    """
+    db = sqlite3.connect(str(DB_PATH), timeout=10)
+    db.row_factory = sqlite3.Row
+    db.execute('PRAGMA journal_mode=WAL')
+    db.execute('PRAGMA synchronous=NORMAL')
+    return db
+
+
+def _energy_sample_once():
+    """采一次电压入库，返回是否写入。"""
+    pw = voltage_payload()
+    b = pw.get('battery') or {}
+    p = pw.get('pv') or {}
+    bv, pv = b.get('voltage'), p.get('voltage')
+    if bv is None and pv is None:
+        return False        # ADC 读不到就别写空行，免得时间轴被一堆空洞占满
+    db = _db_direct()
+    try:
+        db.execute(
+            'INSERT INTO voltage_readings(ts,ts_epoch,battery,pv,battery_raw,pv_raw)'
+            ' VALUES(?,?,?,?,?,?)',
+            (now_iso(), time.time(), bv, pv, b.get('raw'), p.get('raw')))
+        db.commit()
+        return True
+    finally:
+        db.close()
+
+
+def _energy_purge(days):
+    """按保留天数清理旧采样。"""
+    cut = time.time() - energy_service.clamp_retention_days(days) * 86400.0
+    db = _db_direct()
+    try:
+        cur = db.execute('DELETE FROM voltage_readings WHERE ts_epoch < ?', (cut,))
+        db.commit()
+        return cur.rowcount or 0
+    finally:
+        db.close()
+
+
+def _energy_sampler():
+    """后台采样线程：间隔与保留天数都是设置项，改完下一轮即生效。"""
+    time.sleep(15)                 # 先让 ADC 与电压校准就绪
+    last_purge = 0.0
+    while True:
+        try:
+            if bool_setting('energy_log_enabled', True):
+                _energy_sample_once()
+                now = time.time()
+                if now - last_purge > 3600:
+                    last_purge = now
+                    n = _energy_purge(_setting_direct('energy_retention_days', '365'))
+                    if n:
+                        print('[ENERGY] 清理 %d 条过期电压采样' % n, flush=True)
+        except Exception as e:
+            print('[ENERGY] 采样异常: %s: %s' % (type(e).__name__, e), flush=True)
+        time.sleep(energy_service.clamp_sample_sec(
+            _setting_direct('energy_sample_sec', '60')))
+
+
+def _energy_day_rows(day):
+    """取某天的原始采样（升序）。一天按 60s 采样也就 1440 行，直接全取。"""
+    db = get_db()
+    return [dict(r) for r in db.execute(
+        'SELECT ts,ts_epoch,battery,pv,battery_raw,pv_raw FROM voltage_readings '
+        'WHERE ts LIKE ? ORDER BY ts_epoch ASC LIMIT 20000',
+        (str(day)[:10] + '%',)).fetchall()]
+
+
+def _energy_days(limit=120):
+    """有采样的日期列表（新→旧），供前端日期下拉。"""
+    db = get_db()
+    return [r['day'] for r in db.execute(
+        "SELECT substr(ts,1,10) AS day FROM voltage_readings "
+        "GROUP BY day ORDER BY day DESC LIMIT ?", (int(limit),)).fetchall()]
+
+
+@app.route('/api/energy/day')
+@login_required
+def api_energy_day():
+    """某天的电压时间轴 + 当日统计。"""
+    day = (request.args.get('day') or '').strip()[:10] or \
+        datetime.now().strftime('%Y-%m-%d')
+    interval = energy_service.clamp_interval(request.args.get('interval') or 5)
+    rows = _energy_day_rows(day)
+    return api_ok(day=day, interval=interval,
+                  points=energy_service.points_from_rows(rows, interval),
+                  stats=energy_service.day_stats(rows),
+                  days=_energy_days(),
+                  logging={
+                      'enabled': bool_setting('energy_log_enabled', True),
+                      'sample_sec': energy_service.clamp_sample_sec(
+                          _setting_direct('energy_sample_sec', '60')),
+                      'retention_days': energy_service.clamp_retention_days(
+                          _setting_direct('energy_retention_days', '365')),
+                  })
+
+
+@app.route('/api/energy/export')
+@login_required
+def api_energy_export():
+    """整日序列导出 CSV。带 BOM，Excel 打开中文表头才不乱码。"""
+    day = (request.args.get('day') or '').strip()[:10] or \
+        datetime.now().strftime('%Y-%m-%d')
+    body = '\ufeff' + energy_service.rows_to_csv(_energy_day_rows(day))
+    return Response(
+        body, mimetype='text/csv; charset=utf-8',
+        headers={'Content-Disposition':
+                 'attachment; filename=energy_%s.csv' % day})
+
+
 @app.route('/api/status')
 @login_required
 def api_status():
@@ -1139,7 +1285,6 @@ def api_settings_get():
         'assist_history_turns',
         'assist_max_input_chars',
         'assist_temperature',
-        'assist_provider',
         'assist_use_tools',
         'assist_agent_iters',
         'assist_keep_llm_warm',
@@ -1168,6 +1313,8 @@ def api_settings_get():
         'aprs_dedup_window', 'aprs_telemetry_map', 'aprs_retention_days',
         'aprs_map_provider', 'aprs_map_tk', 'aprs_map_tk_browser',
         'aprs_map_layers', 'aprs_map_cache_mb', 'aprs_track_points',
+        'reboot_enabled', 'reboot_times', 'reboot_notice_sec', 'reboot_text',
+        'energy_log_enabled', 'energy_sample_sec', 'energy_retention_days',
     ]
     out = {k: get_setting(k) for k in keys}
     out['local_api_key_set'] = bool(out.get('local_api_key'))
@@ -1192,6 +1339,10 @@ def api_settings_set():
         'external_model': lambda v: str(v).strip(),
         'external_api_key': lambda v: str(v),
         'record_auto_play': lambda v: '1' if str(v) in ('1', 'true', 'True', 'on') else '0',
+        # 能量统计（电压采样）
+        'energy_log_enabled': _bool_caster,
+        'energy_sample_sec': lambda v: str(energy_service.clamp_sample_sec(v)),
+        'energy_retention_days': lambda v: str(energy_service.clamp_retention_days(v)),
         'site_title': lambda v: str(v).strip()[:80],
         'tts_provider': lambda v: str(v).strip(),
         'tts_local_voice': lambda v: str(v).strip()[:80],
@@ -1199,6 +1350,14 @@ def api_settings_set():
         'tts_icao': lambda v: '1' if str(v) in ('1', 'true', 'True', 'on') else '0',
         'tts_icao_voice': lambda v: str(v).strip()[:80],
         'tts_auto_speak': lambda v: '1' if str(v) in ('1', 'true', 'True', 'on') else '0',
+        # 定时重启：只接受 HH:MM，去重并保留顺序；播报提前量与文本都做钳制
+        'reboot_enabled': _bool_caster,
+        'reboot_times': lambda v: ','.join(
+            x.strip() for x in re.split(r'[,;，；\s]+', str(v))
+            if re.match(r'^\d{1,2}:\d{2}$', x.strip())
+            and 0 <= int(x.split(':')[0]) <= 23 and 0 <= int(x.split(':')[1]) <= 59)[:120],
+        'reboot_notice_sec': lambda v: str(max(0, min(600, int(float(v))))),
+        'reboot_text': lambda v: (str(v).strip()[:80] or '中继台即将重启，请稍候。'),
         'tts_provider': lambda v: 'local',   # 外部 TTS 已下线，强制 local
         'llm_system_prompt': lambda v: str(v)[:4000],
         'llm_system_prompt_on': lambda v: '1' if str(v) in ('1', 'true', 'True', 'on') else '0',
@@ -1237,7 +1396,6 @@ def api_settings_set():
         'assist_history_turns': lambda v: str(int(max(0, min(12, int(float(v)))))),
         'assist_max_input_chars': lambda v: str(int(max(400, min(8000, int(float(v)))))),
         'assist_temperature': lambda v: str(round(max(0.0, min(1.5, float(v))), 2)),
-        'assist_provider': lambda v: v if v in ('local', 'external') else 'local',
         'assist_agent_iters': lambda v: str(int(max(0, min(4, int(float(v)))))),
         'assist_llm_wait': lambda v: str(int(max(5, min(120, int(float(v)))))),
         'assist_prompt_suffix': lambda v: str(v)[:2000],
@@ -1636,6 +1794,54 @@ def _agent_ctx():
         return {'datetime': now.strftime('%Y-%m-%d %H:%M:%S'),
                 'weekday': '星期' + '一二三四五六日'[now.weekday()]}
 
+    def get_home_position():
+        """本站自身位置。坐标没配就问不出来——必须返回一句人话，别给空字典。"""
+        try:
+            p = aprs_service_instance.home_position()
+        except Exception as e:
+            return {'error': '%s: %s' % (type(e).__name__, e)}
+        if p.get('lat') is None and p.get('lon') is None:
+            return {'error': '本站坐标未配置（设置 → APRS 位置来源）'}
+        return p
+
+    def get_station_position(call=''):
+        """按呼号查最后位置；呼号留空 = 最近听到的那个台。
+
+        只查得到**收到过 APRS 信标**的台：语音里报的呼号如果从没发过包，
+        这里就是不认识——要如实说，不能让模型编一个坐标出来。
+        """
+        want = str(call or '').strip()
+        try:
+            r = aprs_service_instance.station_position(want)
+        except Exception as e:
+            return {'error': '%s: %s' % (type(e).__name__, e)}
+        if not r:
+            return {'error': ('没收到过 %s 的位置信标' % want) if want
+                    else '本机还没收到过任何带位置的信标'}
+        return r
+
+    def get_nearby_stations(km=50, limit=5):
+        """附近电台排行。结果条数要压住——板端模型看不了长列表。"""
+        try:
+            items = aprs_service_instance.nearby_stations(km=km, limit=limit)
+        except Exception as e:
+            return {'error': '%s: %s' % (type(e).__name__, e)}
+        home = {}
+        try:
+            home = aprs_service_instance.home_position()
+        except Exception:
+            pass
+        if not items:
+            return {'home_valid': bool(home.get('valid')),
+                    'count': 0, 'stations': [],
+                    'note': '最近 %s 小时内没有收到带位置的 APRS 信标' % 24}
+        # 最多 5 条进提示词；每条只留模型真正要说的字段
+        keep = ('call', 'km', 'dir', 'age_min', 'speed_kt')
+        return {'home_valid': bool(home.get('valid')),
+                'count': len(items),
+                'stations': [{k: it[k] for k in keep if k in it}
+                             for it in items[:5]]}
+
     def speak(text=''):
         body = str(text or '').strip()[:200]
         if not body:
@@ -1653,7 +1859,9 @@ def _agent_ctx():
 
     return {'get_weather': get_weather, 'get_rain': get_rain, 'get_power': get_power,
             'get_system': get_system, 'get_radio': get_radio, 'get_camera': get_camera,
-            'get_time': get_time, 'speak': speak}
+            'get_time': get_time, 'get_home_position': get_home_position,
+            'get_station_position': get_station_position,
+            'get_nearby_stations': get_nearby_stations, 'speak': speak}
 
 
 def _llm_headers(key):
@@ -1908,6 +2116,15 @@ def api_agent_chat():
     base_prompt = base_prompt[:4000]
     temperature = float(data.get('temperature', 0.3))
     max_tokens = int(data.get('max_tokens', 1024))
+    # 总结轮要不要回灌基础设定：见 agent_service.summary_spec（auto = 只给外部云模型）
+    sp_mode = (os.environ.get('RELAY_ASSIST_SUMMARY_SPEC') or 'auto').strip().lower()
+    if sp_mode not in agent_service.SUMMARY_SPEC_MODES:
+        sp_mode = 'auto'
+    try:
+        sp_cap = max(120, min(4000, int(
+            os.environ.get('RELAY_ASSIST_SUMMARY_SPEC_MAX') or 1200)))
+    except Exception:
+        sp_cap = 1200
 
     def generate():
         meter_all = agent_service.RateMeter()
@@ -1932,11 +2149,14 @@ def api_agent_chat():
                 content = agent_service.compose_user_prompt(base_prompt, question, enabled)
                 if force:
                     content += '\n现在只输出一行读取指令（格式 READ 名称 {}），不要回答用户。'
+                msgs = [{'role': 'user', 'content': content}]
             else:
-                # 数据已拿到：用一条**很短**的用户消息让模型总结（长提示词会导致空输出）
-                content = ('设备实时数据：' + json.dumps(collected, ensure_ascii=False)[:280] +
-                           '\n请用中文 1~3 句回答：' + question[:100])
-            msgs = [{'role': 'user', 'content': content}]
+                # 数据已拿到：让模型只做总结。约束必须在这一轮重新出现——
+                # **这一轮产出的字才是用户真正看到的**（第一轮被要求只输出读取指令）。
+                msgs = agent_service.summary_messages(
+                    collected, question[:100], base_prompt, provider,
+                    mode=sp_mode, cap=sp_cap,
+                    tail='请用中文 1~3 句回答：')
             payload = {'model': model, 'messages': msgs, 'stream': True,
                        'temperature': temperature, 'max_tokens': max_tokens}
             text = ''
@@ -2034,15 +2254,24 @@ def api_agent_chat():
 # 中继语音日志：BUSY/PTT 触发录音 + 异步 ASR + 智能分类 + 每日总结
 # ---------------------------------------------------------------------------
 def _vlog_settings_direct():
-    """无 app context 读取全部 vlog_* 设置（供语音服务后台线程使用）。"""
+    """无 app context 读取全部 vlog_* 设置（供语音服务后台线程使用）。
+
+    连接必须在 finally 里关（原先 close() 在 try 体内，异常路径会漏连接/fd）。
+    """
     out = {}
+    db = None
     try:
         db = sqlite3.connect(str(DB_PATH), timeout=3)
         for k, v in db.execute("SELECT key,value FROM settings WHERE key LIKE 'vlog_%'"):
             out[k] = v
-        db.close()
     except Exception:
         pass
+    finally:
+        if db is not None:
+            try:
+                db.close()
+            except Exception:
+                pass
     return out
 
 
@@ -2111,6 +2340,10 @@ def api_voice_list():
     category = (request.args.get('category') or '').strip() or None
     kind = (request.args.get('kind') or '').strip() or None
     q = (request.args.get('q') or '').strip() or None
+    # 只看含 APRS 位置的段（尾音里解出对方信标），便于标记与查找
+    pos = (request.args.get('pos') or '').strip() or None
+    if pos not in ('only', 'none'):
+        pos = None
     try:
         limit = max(1, min(1000, int(request.args.get('limit') or 200)))
     except Exception:
@@ -2119,7 +2352,9 @@ def api_voice_list():
         offset = max(0, int(request.args.get('offset') or 0))
     except Exception:
         offset = 0
-    items = voice_service_instance.list_logs(day, category, kind, q, limit, offset)
+    items = voice_service_instance.list_logs(day=day, category=category,
+                                             kind=kind, q=q, pos=pos,
+                                             limit=limit, offset=offset)
     return api_ok(items=items, day=day, limit=limit, offset=offset,
                   stats=voice_service_instance.day_stats(day))
 
@@ -2910,14 +3145,24 @@ def api_asr_recordings():
 # 网页对讲 / 录音分段 / AUX 播放
 # ---------------------------------------------------------------------------
 def _setting_direct(key, default=''):
-    """不依赖 Flask app context 读取设置，供启动阶段/播放线程使用。"""
+    """不依赖 Flask app context 读取设置，供启动阶段/播放线程使用。
+
+    连接必须在 finally 里关：原先 db.close() 直接写在 try 体内，
+    execute 一抛异常就漏一个 SQLite 连接（连带 fd）——实测进程里积了 60 个。
+    """
+    db = None
     try:
         db = sqlite3.connect(str(DB_PATH), timeout=3)
         row = db.execute('SELECT value FROM settings WHERE key=?', (key,)).fetchone()
-        db.close()
         return row[0] if row else default
     except Exception:
         return default
+    finally:
+        if db is not None:
+            try:
+                db.close()
+            except Exception:
+                pass
 
 
 def _amixer_sget(control):
@@ -3233,6 +3478,133 @@ def play_audio_async(path, ptt=False):
         if ptt:
             _ptt_release()
         raise
+
+
+# ---------------------------------------------------------------------------
+# 定时重启计划：每天多个 HH:MM，到点前先语音播报，准点重启
+#
+# 重启需要 root，而本服务跑在 elf 用户下：走 /usr/local/sbin/elf2-reboot.sh 的
+# sudoers 白名单（部署文件 board/deploy/elf2-reboot.sh + 99-elf2-reboot.sudoers）。
+# helper 支持 --check，用于在不重启的前提下验证 sudoers 配没配好。
+# ---------------------------------------------------------------------------
+REBOOT_HELPER = '/usr/local/sbin/elf2-reboot.sh'
+REBOOT_MIN_UPTIME = 300     # 开机 5 分钟内不触发，避免「重启后补触发」滚成重启循环
+REBOOT_FIRE_WINDOW = 90     # 到点后多久内仍允许触发（秒）
+BOOT_TS = time.time()
+_reboot_state = {}
+
+
+def _reboot_times():
+    """解析设置里的 HH:MM 列表，返回排序去重后的 [(h, m)]。"""
+    raw = _setting_direct('reboot_times', '') or ''
+    out = []
+    for part in re.split(r'[,;，；\s]+', raw):
+        m = re.match(r'^(\d{1,2}):(\d{2})$', part.strip())
+        if not m:
+            continue
+        h, mi = int(m.group(1)), int(m.group(2))
+        if 0 <= h <= 23 and 0 <= mi <= 59 and (h, mi) not in out:
+            out.append((h, mi))
+    return sorted(out)
+
+
+def _reboot_helper(args=None):
+    """同步调用重启 helper，返回 (ok, 输出)。带 --check 时只验证权限不重启。"""
+    cmd = ['sudo', '-n', REBOOT_HELPER] + list(args or [])
+    try:
+        p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=15)
+        return p.returncode == 0, p.stdout.decode('utf-8', 'replace').strip()
+    except Exception as e:
+        return False, f'{type(e).__name__}: {e}'
+
+
+def _reboot_announce(text):
+    """阻塞播报（AUX + PTT），返回 (ok, err)。重启前通告必须等它播完。"""
+    try:
+        path = tts_service.synthesize_multilingual(
+            text,
+            _setting_direct('tts_local_voice', 'zh_CN-huayan-medium'),
+            en_voice=(_setting_direct('tts_en_voice', '') or None),
+            icao=str(_setting_direct('tts_icao', '1')) in ('1', 'true', 'True', 'on'),
+            icao_voice=(_setting_direct('tts_icao_voice', '') or None))
+    except Exception as e:
+        return False, f'合成失败：{e}'
+    _ptt_retain()
+    try:
+        proc = _play_file_locked(path)
+        if proc:
+            try:
+                proc.wait(timeout=120)
+            except Exception:
+                _stop_proc(proc)
+    finally:
+        _ptt_release()
+    return True, ''
+
+
+def _reboot_scheduler():
+    time.sleep(30)          # 等服务起来，别在启动风暴里抢资源
+    while True:
+        try:
+            if (str(_setting_direct('reboot_enabled', '0')) in ('1', 'true', 'True', 'on')
+                    and (time.time() - BOOT_TS) > REBOOT_MIN_UPTIME):
+                now = datetime.now()
+                notice = int(float(_setting_direct('reboot_notice_sec', '30') or 30))
+                text = _setting_direct('reboot_text', '') or '中继台即将重启，请稍候。'
+                for (h, mi) in _reboot_times():
+                    due = now.replace(hour=h, minute=mi, second=0, microsecond=0)
+                    key = due.strftime('%Y-%m-%d %H:%M')
+                    st = _reboot_state.setdefault(key, {'announced': False, 'fired': False})
+                    delta = (now - due).total_seconds()
+                    # 播报窗：due - notice <= now < due
+                    if not st['announced'] and -notice <= delta < 0:
+                        st['announced'] = True
+                        ok, err = _reboot_announce(text)
+                        print(f'[REBOOT] {key} 播报{"成功" if ok else "失败 " + err}', flush=True)
+                    # 触发窗：due <= now < due + 90s
+                    if not st['fired'] and 0 <= delta < REBOOT_FIRE_WINDOW:
+                        _ptt_force_low()
+                        ok, out = _reboot_helper()
+                        st['fired'] = ok
+                        print(f'[REBOOT] {key} 触发重启 ok={ok} {out}', flush=True)
+                today = now.strftime('%Y-%m-%d')
+                for k in [k for k in _reboot_state if not k.startswith(today)]:
+                    _reboot_state.pop(k, None)
+        except Exception as e:
+            print(f'[REBOOT] 调度异常: {e}', flush=True)
+        time.sleep(20)
+
+
+threading.Thread(target=_reboot_scheduler, daemon=True).start()
+
+
+@app.route('/api/reboot/check')
+@login_required
+@admin_required
+def api_reboot_check():
+    """只验证 sudoers 权限，不重启。"""
+    ok, out = _reboot_helper(['--check'])
+    return api_ok(ok=ok, output=out, helper=REBOOT_HELPER,
+                  times=[f'{h:02d}:{m:02d}' for h, m in _reboot_times()])
+
+
+@app.route('/api/reboot/now', methods=['POST'])
+@login_required
+@admin_required
+def api_reboot_now():
+    """手动立即重启。先同步验证权限，再延迟下发，好让响应能发出去。"""
+    ok, out = _reboot_helper(['--check'])
+    if not ok:
+        return api_err(f'重启权限未就绪（检查 sudoers）：{out}')
+    audit('reboot_now', 'manual')
+    _ptt_force_low()
+
+    def _go():
+        time.sleep(1.5)
+        _reboot_helper()
+
+    threading.Thread(target=_go, daemon=True).start()
+    return api_ok(ok=True, note='已下发重启命令，连接会中断')
 
 
 # ---------------------------------------------------------------------------
@@ -3956,29 +4328,6 @@ def api_tts_upload_voice():
         return api_err(f'音色包上传失败：{e}', 400)
     audit('tts_upload_voice', f'{result["id"]}')
     return api_ok(result=result, voices=tts_service.list_voices())
-
-
-@app.route('/api/tts/training/upload', methods=['POST'])
-@login_required
-@admin_required
-def api_tts_training_upload():
-    if 'dataset' not in request.files:
-        return api_err('请上传训练数据 zip')
-    f = request.files['dataset']
-    dataset_id = request.form.get('dataset_id') or (Path(f.filename or 'dataset').stem)
-    try:
-        result = tts_service.save_training_zip(f, dataset_id)
-    except Exception as e:
-        return api_err(f'训练数据上传失败：{e}', 400)
-    audit('tts_upload_training', result['dataset_id'])
-    return api_ok(result=result, jobs=tts_service.list_training_jobs())
-
-
-@app.route('/api/tts/training/jobs')
-@login_required
-@admin_required
-def api_tts_training_jobs():
-    return api_ok(jobs=tts_service.list_training_jobs())
 
 
 @app.route('/recordings/<path:filename>')
@@ -5597,15 +5946,24 @@ def api_weather():
 # 中继语音助手：BUSY 语音唤醒 → ASR → LLM → TTS → 受控发射
 # ---------------------------------------------------------------------------
 def _assist_settings_direct():
-    """无 app context 读取全部 assist_* 设置（供助手后台线程使用）。"""
+    """无 app context 读取全部 assist_* 设置（供助手后台线程使用）。
+
+    连接必须在 finally 里关（原先 close() 在 try 体内，异常路径会漏连接/fd）。
+    """
     out = {}
+    db = None
     try:
         db = sqlite3.connect(str(DB_PATH), timeout=3)
         for k, v in db.execute("SELECT key,value FROM settings WHERE key LIKE 'assist_%'"):
             out[k] = v
-        db.close()
     except Exception:
         pass
+    finally:
+        if db is not None:
+            try:
+                db.close()
+            except Exception:
+                pass
     return out
 
 
@@ -5655,7 +6013,7 @@ def _assist_channel_busy():
 
 
 def _assist_ask(prompt, question='', max_tokens=256, temperature=0.3,
-                use_tools=True, max_iters=2):
+                use_tools=True, max_iters=2, sysprompt=''):
     """阻塞式 LLM 调用（可选 Agent 工具循环），供中继语音助手后台线程使用。
 
     参数说明（两者不能混用）：
@@ -5663,6 +6021,11 @@ def _assist_ask(prompt, question='', max_tokens=256, temperature=0.3,
                   只用于**第一轮**。绝不能再拿它去拼第二轮，否则模型会把
                   系统设定当成用户问题照抄回来（实测踩过）。
       question —— 用户那一句短问题，只用于**拿到数据后的总结轮**。
+      sysprompt—— 基础设定+语音播报规范的**原文**（不含历史与问题）。总结轮要
+                  靠它重新约束输出：真正被朗读的文本是总结轮产出的，而第一轮在
+                  force_first 下被要求「只输出读取指令、不要回答用户」，约束若
+                  只出现在第一轮，模型就当没看见（2026-09-26 实测：规范里的
+                  「全中文单位」「每句加喵」对 deepseek-chat 全部未生效）。
 
     为什么不用 /api/agent/chat 那套 SSE：助手要的是**完整一句话**才能合成语音，
     流式只增加复杂度没有收益，而且这里必须在后台线程里同步拿到结果。
@@ -5672,7 +6035,9 @@ def _assist_ask(prompt, question='', max_tokens=256, temperature=0.3,
     out = {'ok': False, 'reply': '', 'ms': 0, 'provider': '', 'model': '',
            'iters': 0, 'tools': '', 'error': ''}
     try:
-        provider = (_setting_direct('assist_provider', 'local') or 'local').strip()
+        # LLM 提供方跟随「设置 / 校准」里的全局 llm_provider：
+        # 助手页已不再单独设置，避免两处各说各话。
+        provider = (_setting_direct('llm_provider', 'local') or 'local').strip()
         if provider not in ('local', 'external'):
             provider = 'local'
         cfg = provider_config(provider) or {}
@@ -5708,6 +6073,16 @@ def _assist_ask(prompt, question='', max_tokens=256, temperature=0.3,
         # q_short 只用于总结轮；prompt 只用于第一轮
         q_short = (question or '').strip() or (prompt or '')[:120]
         q_short = q_short[:120]
+        # 总结轮要不要回灌约束、回灌多少：见 agent_service.summary_spec 的说明。
+        # auto = 只给外部云模型（板端 RKLLM 提示词一长就空输出）。
+        sp_mode = (os.environ.get('RELAY_ASSIST_SUMMARY_SPEC') or 'auto').strip().lower()
+        if sp_mode not in agent_service.SUMMARY_SPEC_MODES:
+            sp_mode = 'auto'
+        try:
+            sp_cap = max(120, min(4000, int(
+                os.environ.get('RELAY_ASSIST_SUMMARY_SPEC_MAX') or 1200)))
+        except Exception:
+            sp_cap = 1200
         collected, used = [], []
         text = ''
         force_first = agent_on and agent_service.wants_realtime(q_short or prompt)
@@ -5722,13 +6097,15 @@ def _assist_ask(prompt, question='', max_tokens=256, temperature=0.3,
                     if force_first:
                         content += ('\n现在只输出一行读取指令'
                                     '（格式 READ 名称 {}），不要回答用户。')
+                msgs = [{'role': 'user', 'content': content}]
             else:
-                # 数据已拿到：用一条**很短**的用户消息让它总结。
-                # 板端 RKLLM 提示词一长就空输出，这里必须短。
-                content = ('设备实时数据：' + json.dumps(collected, ensure_ascii=False)[:280] +
-                           '\n直接给结论，不要说「根据数据」「根据您提供的数据」这类开场白，不要复述问题，用中文 1~2 句回答：' + q_short)
+                # 数据已拿到：让模型只做「总结成一句话」这一件事。
+                # 行为约束必须在这一轮重新出现：**这一轮产出的才是被朗读的文本**。
+                msgs = agent_service.summary_messages(
+                    collected, q_short, sysprompt, provider,
+                    mode=sp_mode, cap=sp_cap)
             body = {'model': cfg.get('model') or 'qwen2.5-1.5b',
-                    'messages': [{'role': 'user', 'content': content}],
+                    'messages': msgs,
                     'max_tokens': int(max_tokens), 'temperature': float(temperature),
                     'stream': False}
             r = requests.post(cfg['url'], json=body,
@@ -5759,6 +6136,14 @@ def _assist_ask(prompt, question='', max_tokens=256, temperature=0.3,
                     res = fn(**(c.get('arguments') or {})) if fn else {'error': '未知工具'}
                 except Exception as e:
                     res = {'error': '%s: %s' % (type(e).__name__, e)}
+                # 工具报错必须留痕。模型拿到 error 会如实答「不知道」，而
+                # 「调用了工具」这个事实照样成立——没有这一行，外部完全分辨
+                # 不出「工具抛异常」和「工具没数据」。实测踩过：板端
+                # aprs_service 漏部署，三个位置问题全答「不知道」，而验证脚本
+                # 只看 tools 字段，20 项全绿却掩盖了故障。
+                if isinstance(res, dict) and res.get('error'):
+                    print('[ASSIST] 工具 %s 出错：%s' % (
+                        c['name'], str(res.get('error'))[:160]), flush=True)
                 collected.append({c['name']: res})
             out['tools'] = ','.join(used)
             if not collected:
@@ -5768,10 +6153,9 @@ def _assist_ask(prompt, question='', max_tokens=256, temperature=0.3,
         if collected and (not text or agent_service.parse_tool_calls(text, valid=valid)):
             voice_service.llm_lease(300.0)
             body = {'model': cfg.get('model') or 'qwen2.5-1.5b',
-                    'messages': [{'role': 'user', 'content':
-                                  '设备实时数据：' +
-                                  json.dumps(collected, ensure_ascii=False)[:280] +
-                                  '\n直接给结论，不要说「根据数据」「根据您提供的数据」这类开场白，不要复述问题，用中文 1~2 句回答：' + q_short}],
+                    'messages': agent_service.summary_messages(
+                        collected, q_short, sysprompt, provider,
+                        mode=sp_mode, cap=sp_cap),
                     'max_tokens': int(max_tokens), 'temperature': float(temperature),
                     'stream': False}
             r = requests.post(cfg['url'], json=body,
@@ -6049,6 +6433,116 @@ def api_assist_clean():
     return api_ok(raw=text, cleaned=cleaned, raw_len=len(text), cleaned_len=len(cleaned))
 
 
+class _ReleaseOnClose:
+    """包住 WSGI 可迭代对象，在响应真正结束时才释放并发额度。
+
+    流式响应（MJPEG / PCM / SSE）的迭代体是在中间件的 __call__ 返回之后
+    才被消费的，所以在 __call__ 的 finally 里释放会让流式请求完全不占额度。
+    """
+
+    def __init__(self, iterable, sem):
+        self._it = iter(iterable)
+        self._sem = sem
+        self._done = False
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        try:
+            return next(self._it)
+        except StopIteration:
+            self._release()
+            raise
+
+    def close(self):
+        self._release()
+        closer = getattr(self._it, 'close', None)
+        if closer is not None:
+            try:
+                closer()
+            except Exception:
+                pass
+
+    def _release(self):
+        if not self._done:
+            self._done = True
+            self._sem.release()
+
+
+class _BoundedConcurrency:
+    """WSGI 中间件：限制**同时**进入 Flask 的请求数。
+
+    板端是单进程 Flask + GIL。Werkzeug 开发服务器是 thread-per-connection
+    且没有上限，前端一旦出现轮询重叠，积压就直接变成线程数：几百个线程抢
+    一把 GIL，接口从 40ms 劣化到 10~27 秒。这里把并发锁死，超载时是排队
+    （或明确 503），而不是无限起线程。
+    """
+
+    def __init__(self, inner, limit):
+        self.inner = inner
+        self.sem = threading.BoundedSemaphore(max(1, int(limit)))
+        try:
+            self.timeout = float(os.environ.get('RELAY_WEB_QUEUE_TIMEOUT', '30') or 30)
+        except Exception:
+            self.timeout = 30.0
+
+    def __call__(self, environ, start_response):
+        if not self.sem.acquire(timeout=self.timeout):
+            start_response('503 Service Unavailable',
+                           [('Content-Type', 'text/plain; charset=utf-8'),
+                            ('Retry-After', '5')])
+            return [b'busy: too many concurrent requests\n']
+        try:
+            iterable = self.inner(environ, start_response)
+        except Exception:
+            self.sem.release()
+            raise
+        return _ReleaseOnClose(iterable, self.sem)
+
+
+def _serve():
+    """启动 Web 服务（有界并发）。
+
+    优先用 waitress（真正的有界线程池）；没装就退回 Werkzeug，但套一层信号量
+    中间件把**同时执行**的请求数限住，保证「超载 = 排队」而不是
+    「超载 = 线程无限增长」。
+
+    环境变量：
+      RELAY_WEB_SERVER=werkzeug   强制回退（waitress 若在某场景有问题时的后路）
+      RELAY_WEB_SERVER=waitress   强制用 waitress（未安装则报错并回退）
+      RELAY_WEB_THREADS           并发上限，默认 16
+    """
+    port = int(os.environ.get('RELAY_WEB_PORT', '8080'))
+    try:
+        threads = max(2, int(os.environ.get('RELAY_WEB_THREADS', '16') or 16))
+    except Exception:
+        threads = 16
+
+    prefer = (os.environ.get('RELAY_WEB_SERVER') or 'auto').strip().lower()
+    waitress_serve = None
+    if prefer != 'werkzeug':
+        try:
+            from waitress import serve as waitress_serve
+        except ImportError:
+            waitress_serve = None
+            if prefer == 'waitress':
+                print('[WEB] 指定了 waitress 但未安装，回退 Werkzeug', flush=True)
+
+    if waitress_serve is None:
+        print('[WEB] Werkzeug + 并发信号量阀（同时请求上限 %d）；'
+              '安装 waitress 可换成真正的有界线程池' % threads, flush=True)
+        app.wsgi_app = _BoundedConcurrency(app.wsgi_app, threads)
+        app.run(host='0.0.0.0', port=port, debug=False, threaded=True)
+        return
+
+    print('[WEB] waitress 有界线程池启动：0.0.0.0:%d threads=%d' % (port, threads),
+          flush=True)
+    waitress_serve(app, host='0.0.0.0', port=port, threads=threads,
+                   connection_limit=max(threads * 4, 64),
+                   channel_timeout=900, ident='elf2-relay-web')
+
+
 if __name__ == '__main__':
     init_db()
     _ensure_audio_unmuted()
@@ -6065,5 +6559,7 @@ if __name__ == '__main__':
     except Exception:
         pass
     # 循环录像守护线程已在模块加载时启动（见 _camera_autostart_worker）
-    app.run(host='0.0.0.0', port=int(os.environ.get('RELAY_WEB_PORT', '8080')),
-            debug=False, threaded=True)
+    # 能量统计采样线程：表已由上面的 init_db() 建好，这里起最稳
+    threading.Thread(target=_energy_sampler, daemon=True,
+                     name='energy-sampler').start()
+    _serve()

@@ -94,6 +94,24 @@
     }
   }
 
+  // ---------------- 总览页子选项卡（运行概览 / 能量统计） ----------------
+  function initOverviewSubtabs() {
+    const box = $('#ov-subtabs');
+    if (!box) return;
+    $$('.sub-tab-btn', box).forEach(btn => {
+      btn.addEventListener('click', () => {
+        $$('.sub-tab-btn', box).forEach(b => b.classList.toggle('active', b === btn));
+        $$('#tab-overview .sub-panel').forEach(
+          p => p.classList.toggle('active', p.id === btn.dataset.subtab));
+        if (btn.dataset.subtab === 'ov-energy') {
+          // 首次切进来才拉数据：别让它在总览轮询里白拉一整天
+          if (!energyState.loaded) loadEnergy();
+          else drawEnergyChart();
+        }
+      });
+    });
+  }
+
   // ---------------- overview ----------------
   async function loadStatus() {
     try {
@@ -200,6 +218,40 @@
     } catch (e) { showToast(e.message, 'error'); }
   }
 
+  // 能量统计采样设置（采样间隔 / 保留天数 / 是否落库）
+  async function loadEnergySettings() {
+    try {
+      const d = await apiFetch('/api/settings');
+      const s = d.settings || d || {};
+      if ($('#energy-sample-sec')) {
+        $('#energy-sample-sec').value = s.energy_sample_sec ?? 60;
+      }
+      if ($('#energy-retention-days')) {
+        $('#energy-retention-days').value = s.energy_retention_days ?? 365;
+      }
+      if ($('#energy-log-enabled')) {
+        $('#energy-log-enabled').value =
+          String(s.energy_log_enabled ?? '1') === '0' ? '0' : '1';
+      }
+    } catch (e) { /* 设置页读不到不该挡住整个总览 */ }
+  }
+
+  async function saveEnergySettings() {
+    try {
+      await apiFetch('/api/settings', {
+        method: 'POST',
+        body: JSON.stringify({
+          energy_sample_sec: parseInt($('#energy-sample-sec')?.value ?? '60', 10),
+          energy_retention_days: parseInt($('#energy-retention-days')?.value ?? '365', 10),
+          energy_log_enabled: $('#energy-log-enabled')?.value ?? '1',
+        }),
+      });
+      showToast('能量统计设置已保存（采样线程下一轮生效）', 'success');
+      loadEnergySettings();
+      if (energyState.loaded) loadEnergy(false);
+    } catch (e) { showToast(e.message, 'error'); }
+  }
+
   // ---------------- users ----------------
   async function loadUsers() {
     if (role !== 'admin') return;
@@ -259,12 +311,19 @@
       if ($('#set-tts-en-voice')) $('#set-tts-en-voice').value = s.tts_en_voice || '';
       if ($('#set-tts-icao')) $('#set-tts-icao').checked = s.tts_icao === '1';
       if ($('#set-tts-icao-voice')) $('#set-tts-icao-voice').dataset.saved = s.tts_icao_voice || '';
-      if ($('#tts-icao')) $('#tts-icao').checked = s.tts_icao !== '0';
       if ($('#set-tts-auto-speak')) $('#set-tts-auto-speak').checked = s.tts_auto_speak === '1';
+      applySpeakPolicy(s.tts_auto_speak === '1');
+      // 定时重启
+      if ($('#set-reboot-enabled')) $('#set-reboot-enabled').checked = s.reboot_enabled === '1';
+      if ($('#set-reboot-times')) $('#set-reboot-times').value = s.reboot_times || '';
+      if ($('#set-reboot-notice')) $('#set-reboot-notice').value = s.reboot_notice_sec || '30';
+      if ($('#set-reboot-text')) $('#set-reboot-text').value = s.reboot_text || '';
+      clearDirty('#llm-save-state'); clearDirty('#tts-save-state'); clearDirty('#reboot-save-state');
     } catch (e) { showToast(e.message, 'error'); }
   }
 
-  async function saveSettings() {
+  // 每张卡片各自保存：LLM/页面 与 语音 分开，避免「改了语音卡片却要按 LLM 卡片的保存」
+  async function saveLlmSettings() {
     const body = {
       llm_provider: $('#set-llm-provider').value,
       local_base_url: $('#set-local-base').value,
@@ -272,21 +331,117 @@
       external_base_url: $('#set-ext-base').value,
       external_model: $('#set-ext-model').value,
       record_auto_play: $('#set-auto-play').checked ? '1' : '0',
+    };
+    if ($('#set-local-key').value) body.local_api_key = $('#set-local-key').value;
+    if ($('#set-ext-key').value) body.external_api_key = $('#set-ext-key').value;
+    try {
+      await apiFetch('/api/settings', { method: 'POST', body: JSON.stringify(body) });
+      showToast('LLM / 页面设置已保存', 'success');
+      clearDirty('#llm-save-state');
+      loadSettings();
+      loadProviders();
+    } catch (e) { showToast(e.message, 'error'); }
+  }
+
+  async function saveTtsSettings() {
+    const body = {
       tts_local_voice: $('#set-tts-voice')?.value || '',
       tts_en_voice: $('#set-tts-en-voice')?.value || '',
       tts_icao: $('#set-tts-icao')?.checked ? '1' : '0',
       tts_icao_voice: $('#set-tts-icao-voice')?.value || '',
       tts_auto_speak: $('#set-tts-auto-speak')?.checked ? '1' : '0',
     };
-    if ($('#set-local-key').value) body.local_api_key = $('#set-local-key').value;
-    if ($('#set-ext-key').value) body.external_api_key = $('#set-ext-key').value;
     try {
       await apiFetch('/api/settings', { method: 'POST', body: JSON.stringify(body) });
-      showToast('设置已保存', 'success');
-      loadSettings();
-      loadProviders();
+      showToast('语音设置已保存（全局生效）', 'success');
+      clearDirty('#tts-save-state');
       loadTtsProviders();
     } catch (e) { showToast(e.message, 'error'); }
+  }
+
+  // ---- 设置页分类收纳：记住展开/收起状态，并提供整页展开/收起 ----
+  function initAccordions() {
+    const boxes = $$('details.acc');
+    if (!boxes.length) return;
+    const KEY = 'elf2-set-acc';
+    let saved = {};
+    try { saved = JSON.parse(localStorage.getItem(KEY) || '{}') || {}; } catch (e) { saved = {}; }
+    const persist = () => {
+      try { localStorage.setItem(KEY, JSON.stringify(saved)); } catch (e) { /* 忽略隐私模式 */ }
+    };
+    boxes.forEach((d) => {
+      const k = d.dataset.acc || '';
+      if (k && typeof saved[k] === 'boolean') d.open = saved[k];
+      d.addEventListener('toggle', () => {
+        if (!k) return;
+        saved[k] = d.open;
+        persist();
+      });
+    });
+    $('#btn-acc-expand')?.addEventListener('click', () => {
+      boxes.forEach((d) => { d.open = true; if (d.dataset.acc) saved[d.dataset.acc] = true; });
+      persist();
+    });
+    $('#btn-acc-collapse')?.addEventListener('click', () => {
+      boxes.forEach((d) => { d.open = false; if (d.dataset.acc) saved[d.dataset.acc] = false; });
+      persist();
+    });
+  }
+
+  // ---- 每卡片「有未保存的修改」提示 ----
+  function bindDirty(cardSel, stateSel) {
+    const card = $(cardSel);
+    if (!card) return;
+    const mark = () => {
+      const el = $(stateSel);
+      if (el) { el.textContent = '● 有未保存的修改'; el.classList.add('dirty'); }
+    };
+    card.addEventListener('input', mark);
+    card.addEventListener('change', mark);
+  }
+
+  function clearDirty(stateSel, text) {
+    const el = $(stateSel);
+    if (el) { el.textContent = text || '已保存'; el.classList.remove('dirty'); }
+  }
+
+  // ---- 定时重启计划 ----
+  async function saveRebootSettings() {
+    const body = {
+      reboot_enabled: $('#set-reboot-enabled')?.checked ? '1' : '0',
+      reboot_times: $('#set-reboot-times')?.value || '',
+      reboot_notice_sec: $('#set-reboot-notice')?.value || '30',
+      reboot_text: $('#set-reboot-text')?.value || '',
+    };
+    try {
+      await apiFetch('/api/settings', { method: 'POST', body: JSON.stringify(body) });
+      showToast('重启计划已保存', 'success');
+      clearDirty('#reboot-save-state');
+      loadSettings();
+    } catch (e) { showToast(e.message, 'error'); }
+  }
+
+  async function checkRebootPermission() {
+    const el = $('#reboot-status');
+    if (el) el.textContent = '检测中…';
+    try {
+      const d = await apiFetch('/api/reboot/check');
+      const times = (d.times || []).join('、') || '（未设置时刻）';
+      if (el) {
+        el.textContent = d.ok
+          ? `重启权限正常（${d.output || ''}）· 生效时刻：${times}`
+          : `重启权限不可用：${d.output || '未知'} —— 检查 /etc/sudoers.d/99-elf2-reboot`;
+      }
+    } catch (e) { if (el) el.textContent = '检测失败：' + e.message; }
+  }
+
+  async function rebootNow() {
+    if (!confirm('确定立即重启中继主控？所有连接会中断约 1~3 分钟。')) return;
+    if (!confirm('再次确认：现在就重启？')) return;
+    try {
+      await apiFetch('/api/reboot/now', { method: 'POST', body: '{}' });
+      showToast('已下发重启命令，连接即将中断', 'success');
+    } catch (e) { showToast('重启失败：' + e.message, 'error'); }
   }
 
   async function changeOwnPassword() {
@@ -401,7 +556,7 @@
     if (!ttsStreamSession || !text || !text.trim()) return;
     const sid = ttsStreamSession;
     const provider = 'local';   // 仅本地 Piper
-    const voice = $('#tts-voice')?.value || '';
+    const voice = ttsVoice();
     // 与 speakText 保持一致：英文音色 / ICAO 开关对流式朗读同样生效
     const body = {
       session_id: sid, client_id: TTS_CLIENT_ID, text, provider, voice,
@@ -511,7 +666,7 @@
     chatMessages.push({ role: 'user', content: text });
     addChatBubble('user', text);
     $('#chat-text').value = '';
-    const autoSpeak = !!$('#tts-auto-speak')?.checked;
+    const autoSpeak = speakPolicyOn;
     const streamBox = $('#chat-stream');
     if (autoSpeak && streamBox && !streamBox.checked) streamBox.checked = true;
     const stream = !!(streamBox && streamBox.checked);
@@ -594,18 +749,22 @@
   }
 
   async function maybeAutoSpeak(text) {
-    if (!$('#tts-auto-speak')?.checked) return;
+    if (!speakPolicyOn) return;
     try {
-      await speakText(text, 'local', $('#tts-voice')?.value || '', true, false, ttsEnVoice(), ttsIcao());
+      await speakText(text, 'local', ttsVoice(), true, false, ttsEnVoice(), ttsIcao());
     } catch (e) {
       showToast('TTS 朗读失败：' + e.message, 'error');
     }
   }
 
   // ---------------- TTS ----------------
-  function ttsEnVoice() { return $('#tts-en-voice')?.value || $('#set-tts-en-voice')?.value || ''; }
+  // 语音音色 / ICAO / 流式朗读策略的唯一来源是「设置 / 校准」页。
+  // LLM 对话页与助手页不再放这些控件，避免同一开关两处各说各话。
+  let speakPolicyOn = false;
+  function ttsVoice() { return $('#set-tts-voice')?.value || ''; }
+  function ttsEnVoice() { return $('#set-tts-en-voice')?.value || ''; }
   function ttsIcao() {
-    const el = $('#tts-icao') || $('#set-tts-icao');
+    const el = $('#set-tts-icao');
     return el ? !!el.checked : true;
   }
 
@@ -638,22 +797,43 @@
     } catch (e) { showToast(e.message, 'error'); }
   }
 
+  // 朗读策略落地：policy 是「行为开关」，必须最先应用。
+  // 原来这三行写在整个 try 的最末尾，前面「列音色包 / 渲染音色表」任何一步抛异常，
+  // 策略就被静默跳过、复选框保持 HTML 默认的未勾选 → 流式朗读一声不响地关掉。
+  function applySpeakPolicy(on) {
+    speakPolicyOn = !!on;
+    if ($('#set-tts-auto-speak')) $('#set-tts-auto-speak').checked = !!on;
+    if (on && $('#chat-stream')) $('#chat-stream').checked = true;
+    const st = $('#tts-stream-status');
+    if (st && !ttsStreamSession) {
+      st.textContent = on ? '流式朗读：策略已开（发送即边出字边朗读）'
+                          : '流式朗读：策略关闭（在「设置 / 校准」开启）';
+    }
+  }
+
   async function loadTtsProviders() {
+    let data;
     try {
-      const data = await apiFetch('/api/tts/providers');
+      data = await apiFetch('/api/tts/providers');
+    } catch (e) {
+      showToast(e.message, 'error');
+      return;
+    }
+    // 先落地策略，再做下面这些纯装饰性的下拉/表格渲染
+    applySpeakPolicy(data.auto_speak);
+    try {
       ttsState.current = 'local';
       ttsState.voices = data.voices || [];
       const voiceOptions = ttsState.voices.map(v =>
         `<option value="${escapeHtml(v.id)}">${escapeHtml(v.name)}${v.ready ? '' : '（不完整）'}</option>`).join('');
       const cur = $('#set-tts-voice')?.value || '';
-      if ($('#tts-voice')) $('#tts-voice').innerHTML = voiceOptions || '<option value="">无可选音色</option>';
       if ($('#set-tts-voice')) $('#set-tts-voice').innerHTML = voiceOptions || '<option value="">无可选音色</option>';
       // 英文音色下拉：默认「自动」（按 language=en* 挑一个）
       const enVoices = ttsState.voices.filter(v => String(v.language || '').toLowerCase().startsWith('en'));
       const enOptions = '<option value="">自动（有英文音色就用）</option>' + enVoices.map(v =>
         `<option value="${escapeHtml(v.id)}">${escapeHtml(v.name)}</option>`).join('');
       const savedEn = $('#set-tts-en-voice')?.dataset.saved || '';
-      ['#tts-en-voice', '#set-tts-en-voice'].forEach((sel) => {
+      ['#set-tts-en-voice'].forEach((sel) => {
         const el = $(sel);
         if (!el) return;
         const prev = el.value || savedEn;
@@ -671,17 +851,15 @@
         if (prev && Array.from(icaoSel.options).some(o => o.value === prev)) icaoSel.value = prev;
       }
       const want = data.local?.voice || '';
-      ['#tts-voice', '#set-tts-voice'].forEach((sel) => {
+      ['#set-tts-voice'].forEach((sel) => {
         const el = $(sel);
         if (!el) return;
         const val = el.value || cur || want;
         if (val && Array.from(el.options).some(o => o.value === val)) el.value = val;
       });
       renderVoiceTable();
-      if ($('#tts-auto-speak')) $('#tts-auto-speak').checked = !!data.auto_speak;
-      if ($('#set-tts-auto-speak')) $('#set-tts-auto-speak').checked = !!data.auto_speak;
-      if (data.auto_speak && $('#chat-stream')) $('#chat-stream').checked = true;
     } catch (e) {
+      // 只影响下拉/表格这类展示，策略已在上面落地，不会被这里连累
       showToast(e.message, 'error');
     }
   }
@@ -697,7 +875,6 @@
       body: JSON.stringify({ text, provider, voice, auto_play: autoPlay, en_voice: enVoice || '', icao: !!icao }),
     });
     showToast(`TTS 已合成：${data.voice}（${(data.size / 1024).toFixed(1)} KB）`, 'success');
-    loadRecordings();
     if (playInWeb) playTtsInWeb(data.filename);
     return data;
   }
@@ -779,29 +956,6 @@
     }
   }
 
-  async function uploadTrainingData() {
-    const file = $('#tts-train-zip')?.files?.[0];
-    if (!file) return showToast('请选择训练数据 zip', 'error');
-    const mb = file.size / 1024 / 1024;
-    const fd = new FormData();
-    fd.append('dataset', file, file.name);
-    fd.append('dataset_id', ($('#tts-train-id')?.value || '').trim());
-    const t0 = Date.now();
-    setUploadBar('#train-upload-bar', '#train-upload-info', 0, `准备上传 ${file.name}（${mb.toFixed(1)} MB）…`);
-    try {
-      await uploadWithProgress('/api/tts/training/upload', fd, (r, loaded, total) => {
-        const sp = (loaded / 1024 / 1024) / Math.max(0.001, (Date.now() - t0) / 1000);
-        setUploadBar('#train-upload-bar', '#train-upload-info', r,
-          `上传中 ${(r * 100).toFixed(0)}%（${(loaded / 1048576).toFixed(1)}/${(total / 1048576).toFixed(1)} MB，${sp.toFixed(1)} MB/s）`);
-      });
-      setUploadBar('#train-upload-bar', '#train-upload-info', 1, `上传完成：${file.name}`);
-      showToast('训练数据已上传，板端等待 PC/服务器微调', 'success');
-    } catch (e) {
-      setUploadBar('#train-upload-bar', '#train-upload-info', 0, '上传失败：' + e.message);
-      showToast(e.message, 'error');
-    }
-  }
-
   // ---------------- board microphone capture & stream ----------------
   let micPollTimer = null;
   let micListenAbort = null;
@@ -824,7 +978,7 @@
       if ($('#mic-device')) $('#mic-device').textContent = l.device || '--';
       setBar('#mic-level-bar', level);
       if (!l.running && micPollTimer) {
-        clearInterval(micPollTimer);
+        micPollTimer.stop();
         micPollTimer = null;
       }
     } catch (e) { /* ignore polling errors */ }
@@ -866,8 +1020,10 @@
     try {
       await apiFetch('/api/mic/capture/start', { method: 'POST', body: '{}' });
       showToast('开发板麦克风采集已启动', 'success');
-      if (!micPollTimer) micPollTimer = setInterval(loadMicLevel, 250);
-      loadMicLevel();
+      // 电平轮询 250ms：必须不重叠，否则板端一变慢就是 4 请求/秒的堆积源
+      if (!micPollTimer) {
+        micPollTimer = ELF2Poll.loop(loadMicLevel, 250, { immediate: true });
+      }
     } catch (e) { showToast(e.message, 'error'); }
   }
 
@@ -876,7 +1032,7 @@
       stopMicListen();
       await apiFetch('/api/mic/capture/stop', { method: 'POST', body: '{}' });
       showToast('开发板麦克风采集已停止', 'success');
-      if (micPollTimer) { clearInterval(micPollTimer); micPollTimer = null; }
+      if (micPollTimer) { micPollTimer.stop(); micPollTimer = null; }
       loadMicLevel();
     } catch (e) { showToast(e.message, 'error'); }
   }
@@ -1049,7 +1205,6 @@
       const data = await apiFetch('/api/intercom/upload', { method: 'POST', body: fd });
       showToast(`录音已上传：${data.duration_ms} ms，${(data.size / 1024).toFixed(1)} KB`, 'success');
       $('#record-status').textContent = '录音已上传';
-      loadRecordings();
     } catch (e) {
       showToast('录音上传失败：' + e.message, 'error');
       $('#record-status').textContent = '上传失败';
@@ -1190,25 +1345,6 @@
     setBar('#push-meter', 0);
     const info = $('#push-info');
     if (info) info.textContent = `本次推送 ${(pushBytes / 1024).toFixed(0)} KB；松开按钮或 5 秒无数据，板端会自动释放 PTT。`;
-  }
-
-  async function loadRecordings() {
-    try {
-      const data = await apiFetch('/api/intercom/recordings');
-      const tbody = $('#recordings-table tbody');
-      if (!data.recordings.length) {
-        tbody.innerHTML = '<tr><td colspan="5" class="muted">暂无录音</td></tr>';
-        return;
-      }
-      tbody.innerHTML = data.recordings.map(r => `
-        <tr>
-          <td>${escapeHtml(r.ts)}</td>
-          <td>${escapeHtml(r.username || '--')}</td>
-          <td>${r.duration_ms || 0} ms</td>
-          <td>${((r.size_bytes || 0) / 1024).toFixed(1)} KB</td>
-          <td><button class="btn ghost" data-play="${r.id}">重放</button></td>
-        </tr>`).join('');
-    } catch (e) { showToast(e.message, 'error'); }
   }
 
   async function playTestTone() {
@@ -1759,6 +1895,281 @@
     ctx.fillText(label(points[n - 1]), pad.l + cw - 30, h - 8);
   }
 
+  // ---------------- 能量统计（电池 / 光伏电压全日时间轴） ----------------
+  // 数据来自后台采样器写入的 voltage_readings。电压原先**不落库**，
+  // 所以历史补不回来，时间轴从启用采样之后开始积累。
+  const energyState = {
+    day: '', interval: 5, points: [], stats: null, loaded: false,
+    hover: -1, box: null, scale: null,
+  };
+
+  function energyToday() {
+    const d = new Date();
+    const p = n => String(n).padStart(2, '0');
+    return d.getFullYear() + '-' + p(d.getMonth() + 1) + '-' + p(d.getDate());
+  }
+
+  // X 轴**固定 00:00→24:00**：这样不同日期的曲线能直接叠着比，也才叫「全日时间轴」。
+  function energySecOfDay(epoch) {
+    const d = new Date(epoch * 1000);
+    return d.getHours() * 3600 + d.getMinutes() * 60 + d.getSeconds();
+  }
+
+  function energyFmtV(v, digits = 2) {
+    return (v === null || v === undefined) ? '--' : Number(v).toFixed(digits) + ' V';
+  }
+
+  function energyHm(ts) {
+    const m = /[T ](\d{2}:\d{2}:\d{2})/.exec(ts || '');
+    return m ? m[1] : (ts || '--');
+  }
+
+  function energyVisible() {
+    const p = $('#ov-energy');
+    const t = $('#tab-overview');
+    return !!(p && p.classList.contains('active')
+              && t && t.classList.contains('active'));
+  }
+
+  async function loadEnergy(showToast) {
+    const dayEl = $('#energy-date');
+    const ivEl = $('#energy-interval');
+    const day = (dayEl && dayEl.value) || energyToday();
+    const interval = parseInt((ivEl && ivEl.value) || '5', 10) || 5;
+    energyState.day = day;
+    energyState.interval = interval;
+    try {
+      const d = await apiFetch('/api/energy/day?day=' + encodeURIComponent(day)
+                               + '&interval=' + interval);
+      energyState.points = d.points || [];
+      energyState.stats = d.stats || {};
+      energyState.loaded = true;
+      energyState.hover = -1;
+      renderEnergyCards(d);
+      drawEnergyChart();
+    } catch (e) {
+      if (showToast !== false) toast('能量数据加载失败：' + e.message, 'error');
+    }
+  }
+
+  function renderEnergyCards(d) {
+    const st = d.stats || {};
+    const b = st.battery || {};
+    const p = st.pv || {};
+    const set = (id, txt) => { const el = $('#' + id); if (el) el.textContent = txt; };
+    set('energy-bat-max', energyFmtV(b.max));
+    set('energy-bat-max-ts', energyHm(b.max_ts));
+    set('energy-bat-min', energyFmtV(b.min));
+    set('energy-bat-min-ts', energyHm(b.min_ts));
+    set('energy-bat-avg', energyFmtV(b.avg));
+    set('energy-bat-drop', energyFmtV(st.battery_drop));
+    set('energy-pv-max', energyFmtV(p.max));
+    set('energy-pv-max-ts', energyHm(p.max_ts));
+    set('energy-pv-min', energyFmtV(p.min));
+    set('energy-pv-min-ts', energyHm(p.min_ts));
+    set('energy-pv-avg', energyFmtV(p.avg));
+    set('energy-count', String(st.points || 0) + ' 点');
+    const lg = d.logging || {};
+    set('energy-sample-info', (lg.sample_sec === undefined ? '--' : lg.sample_sec) + ' 秒');
+    set('energy-retention-info',
+        (lg.retention_days === undefined ? '--' : lg.retention_days) + ' 天');
+    set('energy-span', st.first_ts
+        ? (energyHm(st.first_ts) + ' ~ ' + energyHm(st.last_ts)) : '--');
+    const note = $('#energy-note');
+    if (note && lg.enabled === false) {
+      note.textContent = '电压采样当前已关闭（设置 → 硬件校准与射频），时间轴不会有新数据。';
+    }
+  }
+
+  // 缺桶**不连线**：某点为 null 就断开，让图上的空档老实表达「这段时间没采到」，
+  // 而不是拉一条直线假装连续。
+  function drawEnergySeries(ctx, pts, key, color, xOf, yOf) {
+    ctx.strokeStyle = color;
+    ctx.lineWidth = 1.8;
+    ctx.beginPath();
+    let pen = false;
+    pts.forEach(p => {
+      const v = p[key];
+      if (v === null || v === undefined) { pen = false; return; }
+      const x = xOf(p);
+      const y = yOf(v);
+      if (pen) ctx.lineTo(x, y); else ctx.moveTo(x, y);
+      pen = true;
+    });
+    ctx.stroke();
+  }
+
+  function drawEnergyChart() {
+    const canvas = $('#energy-chart');
+    if (!canvas) return;
+    const dpr = window.devicePixelRatio || 1;
+    const w = canvas.clientWidth || 800;
+    const h = canvas.clientHeight || 260;
+    canvas.width = Math.max(300, w) * dpr;
+    canvas.height = h * dpr;
+    const ctx = canvas.getContext('2d');
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.clearRect(0, 0, w, h);
+    ctx.fillStyle = '#0d1526';
+    ctx.fillRect(0, 0, w, h);
+    const pad = { l: 48, r: 14, t: 14, b: 26 };
+    const cw = Math.max(10, w - pad.l - pad.r);
+    const ch = h - pad.t - pad.b;
+    const pts = energyState.points || [];
+    energyState.box = { pad, cw, ch, w, h };
+    ctx.strokeStyle = '#26334d';
+    ctx.lineWidth = 1;
+    for (let i = 0; i <= 4; i++) {
+      const y = pad.t + ch * i / 4;
+      ctx.beginPath(); ctx.moveTo(pad.l, y); ctx.lineTo(pad.l + cw, y); ctx.stroke();
+    }
+    for (let hr = 3; hr < 24; hr += 3) {
+      const x = pad.l + cw * hr / 24;
+      ctx.globalAlpha = (hr % 6 === 0) ? 0.9 : 0.4;
+      ctx.beginPath(); ctx.moveTo(x, pad.t); ctx.lineTo(x, pad.t + ch); ctx.stroke();
+    }
+    ctx.globalAlpha = 1;
+    ctx.fillStyle = '#8fa2c4';
+    ctx.font = '11px Microsoft YaHei';
+    for (let hr = 0; hr <= 24; hr += 3) {
+      const x = pad.l + cw * hr / 24;
+      const lab = String(hr).padStart(2, '0') + ':00';
+      ctx.fillText(lab, Math.min(x, pad.l + cw - 28), h - 8);
+    }
+    if (!pts.length) {
+      ctx.fillStyle = '#8fa2c4';
+      ctx.font = '13px Microsoft YaHei';
+      ctx.fillText('当日暂无电压采样（采样从启用后开始，历史无法回溯）',
+                   pad.l + 10, pad.t + 24);
+      hideEnergyTip();
+      return;
+    }
+    const vals = [];
+    pts.forEach(p => {
+      if (p.battery !== null && p.battery !== undefined) vals.push(+p.battery);
+      if (p.pv !== null && p.pv !== undefined) vals.push(+p.pv);
+    });
+    let lo = vals.length ? Math.min.apply(null, vals) : 0;
+    let hi = vals.length ? Math.max.apply(null, vals) : 1;
+    if (!isFinite(lo) || !isFinite(hi)) { lo = 0; hi = 1; }
+    if (hi - lo < 0.5) { const mid = (hi + lo) / 2; lo = mid - 0.5; hi = mid + 0.5; }
+    const padV = Math.max(0.15, (hi - lo) * 0.12);
+    lo = Math.max(0, lo - padV);
+    hi = hi + padV;
+    const xOf = p => pad.l + cw * (energySecOfDay(p.epoch) / 86400);
+    const yOf = v => pad.t + ch - ch * ((v - lo) / (hi - lo));
+    energyState.scale = { lo, hi };
+    ctx.fillStyle = '#8fa2c4';
+    for (let i = 0; i <= 4; i++) {
+      ctx.fillText((hi - (hi - lo) * i / 4).toFixed(2), 6, pad.t + ch * i / 4 + 4);
+    }
+    drawEnergySeries(ctx, pts, 'battery', '#f5a623', xOf, yOf);
+    drawEnergySeries(ctx, pts, 'pv', '#3b82f6', xOf, yOf);
+    const hi2 = energyState.hover;
+    if (hi2 >= 0 && hi2 < pts.length) {
+      const p = pts[hi2];
+      const x = xOf(p);
+      ctx.strokeStyle = '#8fa2c4';
+      ctx.globalAlpha = 0.6;
+      ctx.beginPath(); ctx.moveTo(x, pad.t); ctx.lineTo(x, pad.t + ch); ctx.stroke();
+      ctx.globalAlpha = 1;
+      [['battery', '#f5a623'], ['pv', '#3b82f6']].forEach(pair => {
+        const v = p[pair[0]];
+        if (v === null || v === undefined) return;
+        ctx.fillStyle = pair[1];
+        ctx.beginPath(); ctx.arc(x, yOf(v), 3.2, 0, Math.PI * 2); ctx.fill();
+      });
+    }
+  }
+
+  function energyNearestIndex(clientX) {
+    const cv = $('#energy-chart');
+    const b = energyState.box;
+    if (!cv || !b || !energyState.points.length) return -1;
+    const rect = cv.getBoundingClientRect();
+    const sec = (clientX - rect.left - b.pad.l) / b.cw * 86400;
+    let bi = -1;
+    let bd = Infinity;
+    energyState.points.forEach((p, i) => {
+      const d = Math.abs(energySecOfDay(p.epoch) - sec);
+      if (d < bd) { bd = d; bi = i; }
+    });
+    return bi;
+  }
+
+  function hideEnergyTip() {
+    const t = $('#energy-tip');
+    if (t) t.classList.add('hidden');
+  }
+
+  function showEnergyTip(i, clientX) {
+    const tip = $('#energy-tip');
+    const b = energyState.box;
+    const p = energyState.points[i];
+    if (!tip || !b || !p) return;
+    const bits = ['<b>' + (p.time || '') + '</b>'];
+    bits.push('<span style="color:#f5a623">电池</span> <b>' + energyFmtV(p.battery) + '</b>');
+    bits.push('<span style="color:#3b82f6">光伏</span> <b>' + energyFmtV(p.pv) + '</b>');
+    if (p.battery_min !== null && p.battery_max !== null
+        && p.battery_max !== p.battery_min) {
+      bits.push('<span style="opacity:.7">本桶 ' + Number(p.battery_min).toFixed(2)
+                + '~' + Number(p.battery_max).toFixed(2) + ' V</span>');
+    }
+    bits.push('<span style="opacity:.7">' + (p.n || 0) + ' 个采样</span>');
+    tip.innerHTML = bits.join('<br>');
+    tip.classList.remove('hidden');
+    const wrap = tip.parentElement;
+    const wrapRect = wrap.getBoundingClientRect();
+    let left = clientX - wrapRect.left + 14;
+    if (left + tip.offsetWidth > wrap.clientWidth - 2) {
+      left = Math.max(2, left - tip.offsetWidth - 28);
+    }
+    tip.style.left = left + 'px';
+    tip.style.top = (b.pad.t + 6) + 'px';
+  }
+
+  function initEnergy() {
+    const cv = $('#energy-chart');
+    if (!cv) return;
+    const di = $('#energy-date');
+    if (di) {
+      di.value = energyToday();
+      di.max = energyToday();
+      di.addEventListener('change', () => loadEnergy());
+    }
+    const iv = $('#energy-interval');
+    if (iv) iv.addEventListener('change', () => loadEnergy());
+    const ex = $('#btn-energy-export');
+    if (ex) {
+      ex.addEventListener('click', () => {
+        const day = ($('#energy-date') && $('#energy-date').value) || energyToday();
+        window.location.href = '/api/energy/export?day=' + encodeURIComponent(day);
+      });
+    }
+    cv.addEventListener('mousemove', ev => {
+      const i = energyNearestIndex(ev.clientX);
+      if (i < 0) { hideEnergyTip(); return; }
+      if (i !== energyState.hover) {
+        energyState.hover = i;
+        drawEnergyChart();
+      }
+      showEnergyTip(i, ev.clientX);
+    });
+    cv.addEventListener('mouseleave', () => {
+      if (energyState.hover !== -1) {
+        energyState.hover = -1;
+        drawEnergyChart();
+      }
+      hideEnergyTip();
+    });
+    window.addEventListener('resize', () => {
+      if (energyVisible()) drawEnergyChart();
+    });
+    // 能量曲线按分钟刷新即可（采样间隔默认 60 秒），且只在子选项卡可见时拉
+    ELF2Poll.loop(() => { if (energyVisible()) loadEnergy(false); }, 60000,
+                  { skipHidden: true });
+  }
+
   // 传感器卡片实时状态（设置页友好显示：是否采集 / 当前值 / 最后成功 / 错误）
   // ---------------- BUSY 接收诊断（设置/校准页） ----------------
   async function pollBusyDiag() {
@@ -2135,7 +2546,7 @@
     chatMessages.push({ role: 'user', content: text });
     addChatBubble('user', text);
     $('#chat-text').value = '';
-    const autoSpeak = !!$('#tts-auto-speak')?.checked;
+    const autoSpeak = speakPolicyOn;
     const el = addChatBubble('assistant', '思考中（可调用技能读取实时数据）…');
     let answer = '';
     llmRateReset();
@@ -2486,6 +2897,7 @@
     $('#btn-save-cal')?.addEventListener('click', saveCalibration);
     bindPttSelfTest();
     $('#btn-cal-design')?.addEventListener('click', fillDesignCal);
+    $('#btn-save-energy')?.addEventListener('click', saveEnergySettings);
     bindVoiceInput();
     $('#btn-save-prompt')?.addEventListener('click', saveLlmAgentSettings);
     $('#btn-save-agent')?.addEventListener('click', saveLlmAgentSettings);
@@ -2500,15 +2912,12 @@
       if (t) { t.value = DEFAULT_LLM_PROMPT; showToast('已填入推荐提示词，记得点保存', 'success'); }
     });
     $('#btn-add-user')?.addEventListener('click', addUser);
-    $('#btn-save-settings')?.addEventListener('click', saveSettings);
+    $('#btn-save-settings')?.addEventListener('click', saveLlmSettings);
     $('#btn-change-pass')?.addEventListener('click', changeOwnPassword);
     $('#btn-llm-refresh')?.addEventListener('click', loadProviders);
     $('#llm-provider')?.addEventListener('change', loadProviders);
     $('#btn-chat-send')?.addEventListener('click', sendChat);
     $('#btn-tts-stop')?.addEventListener('click', stopTtsStream);
-    $('#tts-auto-speak')?.addEventListener('change', (e) => {
-      if (e.target.checked && $('#chat-stream')) $('#chat-stream').checked = true;
-    });
     $('#chat-text')?.addEventListener('keydown', (e) => {
       if (e.key === 'Enter' && !e.shiftKey) {
         e.preventDefault();
@@ -2517,14 +2926,14 @@
     });
     $('#btn-tts-test')?.addEventListener('click', async () => {
       try {
-        await speakText($('#tts-test-text')?.value || 'TTS 测试', 'local', $('#tts-voice')?.value || '', true,
+        await speakText($('#tts-test-text')?.value || 'TTS 测试', 'local', ttsVoice(), true,
                         false, ttsEnVoice(), ttsIcao());
       } catch (e) { showToast(e.message, 'error'); }
     });
     $('#btn-tts-test-web')?.addEventListener('click', async () => {
       try {
         // 只合成、不在板端播放，直接在网页播放器里播放
-        await speakText($('#tts-test-text')?.value || 'TTS 测试', 'local', $('#tts-voice')?.value || '', false, true,
+        await speakText($('#tts-test-text')?.value || 'TTS 测试', 'local', ttsVoice(), false, true,
                         ttsEnVoice(), ttsIcao());
       } catch (e) { showToast(e.message, 'error'); }
     });
@@ -2538,9 +2947,14 @@
     $('#set-tts-en-voice')?.addEventListener('change', (e) => {
       if (e.target) e.target.dataset.saved = e.target.value || '';
     });
-    $('#tts-icao')?.addEventListener('change', () => { /* 仅前端开关，随朗读请求发送 */ });
     $('#btn-tts-voice-upload')?.addEventListener('click', uploadVoicePack);
-    $('#btn-tts-train-upload')?.addEventListener('click', uploadTrainingData);
+    $('#btn-save-tts')?.addEventListener('click', saveTtsSettings);
+    $('#btn-save-reboot')?.addEventListener('click', saveRebootSettings);
+    $('#btn-reboot-check')?.addEventListener('click', checkRebootPermission);
+    $('#btn-reboot-now')?.addEventListener('click', rebootNow);
+    bindDirty('#llm-set-card', '#llm-save-state');
+    bindDirty('#tts-set-card', '#tts-save-state');
+    bindDirty('#reboot-set-card', '#reboot-save-state');
     const micSlider = (id, labelId) => {
       $(id)?.addEventListener('input', (e) => { if ($(labelId)) $(labelId).textContent = e.target.value + '%'; });
     };
@@ -2632,15 +3046,7 @@
       try {
         const data = await apiFetch('/api/intercom/upload', { method: 'POST', body: fd });
         showToast(`WAV 已上传并发送到 AUX：${data.duration_ms} ms`, 'success');
-        loadRecordings();
       } catch (e) { showToast(e.message, 'error'); }
-    });
-    $('#recordings-table')?.addEventListener('click', (e) => {
-      const id = e.target?.dataset?.play;
-      if (!id) return;
-      apiFetch(`/api/intercom/play/${id}`, { method: 'POST', body: '{}' })
-        .then(() => showToast('正在重放录音', 'success'))
-        .catch(err => showToast(err.message, 'error'));
     });
     $('#users-table')?.addEventListener('click', async (e) => {
       const delId = e.target?.dataset?.del;
@@ -2663,16 +3069,18 @@
   document.addEventListener('DOMContentLoaded', () => {
     startBeijingClock();
     initTabs();
+    initOverviewSubtabs();
+    initEnergy();
+    initAccordions();
     initEvents();
     loadStatus();
     loadProviders();
     loadTtsProviders();
-    loadRecordings();
     loadReservedPages();
     loadCameraStatus();
     loadMicLevel();
     loadMicSettings();
-    cameraOsdTimer = setInterval(updateCameraOsd, 1000);
+    cameraOsdTimer = ELF2Poll.loop(updateCameraOsd, 1000);
     if (role === 'admin') {
       loadUsers();
       loadSettings();
@@ -2681,18 +3089,20 @@
       loadSensorStatus();
       loadLlmAgentSettings();
       loadLlmStats();
+      loadEnergySettings();
     }
     loadCalibration();
-    setInterval(loadStatus, 3000);
-    updateRelayState();
-    setInterval(updateRelayState, 1500);
-    setInterval(pollPttDiag, 1200);
-    setInterval(loadRecordings, 10000);
-    setInterval(loadWeatherRealtime, 2000);
-    setInterval(loadWeatherDaily, 10000);
-    setInterval(loadRainRealtime, 2000);
-    setInterval(loadThRealtime, 5000);
-    setInterval(pollBusyDiag, 2000);
-    setInterval(loadRainHourly, 10000);
+    // 全部改成 ELF2Poll.loop：上一次 settle 之后再排下一次，绝不并发叠加。
+    // 原来用 setInterval 时不接口变慢（板端单次可到 10~27s）就会重叠堆积，
+    // 把 Flask 的 GIL 抢死 —— 见 static/js/poll.js 顶部说明。
+    ELF2Poll.loop(loadStatus, 3000);
+    ELF2Poll.loop(updateRelayState, 1500, { immediate: true });
+    ELF2Poll.loop(pollPttDiag, 1200);
+    ELF2Poll.loop(loadWeatherRealtime, 2000);
+    ELF2Poll.loop(loadWeatherDaily, 10000);
+    ELF2Poll.loop(loadRainRealtime, 2000);
+    ELF2Poll.loop(loadThRealtime, 5000);
+    ELF2Poll.loop(pollBusyDiag, 2000);
+    ELF2Poll.loop(loadRainHourly, 10000);
   });
 })();

@@ -12,6 +12,24 @@
   .kv-list b.rec { color: #2ecc71; }          /* 本地录音中 */
   #btn-voice-busy.recording { background: #e74c3c; border-color: #e74c3c; color: #fff; }
   #agent-tool-list label { margin: 2px 0; }
+  /* 总览页子选项卡（运行概览 / 能量统计） */
+  .sub-tabs { display: flex; gap: 6px; margin: 0 0 14px; border-bottom: 1px solid var(--border); }
+  .sub-tab-btn { background: none; border: none; color: var(--muted); cursor: pointer;
+                 padding: 8px 14px; font-size: 14px; border-bottom: 2px solid transparent; }
+  .sub-tab-btn:hover { color: var(--fg); }
+  .sub-tab-btn.active { color: var(--fg); border-bottom-color: #4a6cf7; font-weight: 600; }
+  .sub-panel { display: none; }
+  .sub-panel.active { display: block; }
+  /* 能量统计：画布 + 悬停提示 */
+  .energy-wrap { position: relative; }
+  #energy-chart { width: 100%; height: 260px; display: block; border-radius: 8px; }
+  .energy-tip { position: absolute; pointer-events: none; z-index: 5;
+                background: rgba(13, 21, 38, .96); border: 1px solid #26334d;
+                border-radius: 8px; padding: 7px 10px; font-size: 12px; line-height: 1.5;
+                color: #e6edf7; white-space: nowrap; box-shadow: 0 6px 20px rgba(0,0,0,.45); }
+  .energy-tip.hidden { display: none; }
+  .energy-tip b { font-variant-numeric: tabular-nums; }
+  .energy-dot { display: inline-block; width: 9px; height: 9px; border-radius: 2px; }
 </style>
 {% endblock %}
 {% block content %}
@@ -22,6 +40,12 @@
     <h2>中继运行总览</h2>
     <span class="muted" id="last-update">--</span>
   </div>
+  <div class="sub-tabs" id="ov-subtabs">
+    <button class="sub-tab-btn active" data-subtab="ov-run">运行概览</button>
+    <button class="sub-tab-btn" data-subtab="ov-energy">能量统计</button>
+  </div>
+
+  <div class="sub-panel active" id="ov-run">
   <div class="grid grid-3">
     <div class="card">
       <div class="card-title">电池电压</div>
@@ -64,6 +88,73 @@
       </div>
     </div>
   </div>
+  </div><!-- /#ov-run -->
+
+  <div class="sub-panel" id="ov-energy">
+    <div class="panel-head">
+      <h3>能量统计（电池 / 光伏电压）</h3>
+      <div class="row gap">
+        <label class="inline-label">日期</label>
+        <input type="date" id="energy-date">
+        <label class="inline-label">时间轴采样</label>
+        <select id="energy-interval">
+          <option value="1">1 分钟</option>
+          <option value="5" selected>5 分钟</option>
+          <option value="10">10 分钟</option>
+          <option value="30">30 分钟</option>
+          <option value="60">60 分钟</option>
+        </select>
+        <button class="btn ghost" id="btn-energy-export">导出 CSV</button>
+      </div>
+    </div>
+    <div class="grid grid-3">
+      <div class="card">
+        <div class="card-title">电池电压（当日）</div>
+        <div class="kv-list">
+          <div><span>最高</span><b id="energy-bat-max">-- V</b></div>
+          <div><span>最高时刻</span><b id="energy-bat-max-ts">--</b></div>
+          <div><span>最低</span><b id="energy-bat-min">-- V</b></div>
+          <div><span>最低时刻</span><b id="energy-bat-min-ts">--</b></div>
+          <div><span>平均</span><b id="energy-bat-avg">-- V</b></div>
+          <div><span>峰谷差</span><b id="energy-bat-drop" title="当日最高与最低之差，反映负载/光照波动">-- V</b></div>
+        </div>
+      </div>
+      <div class="card">
+        <div class="card-title">光伏电压（当日）</div>
+        <div class="kv-list">
+          <div><span>最高</span><b id="energy-pv-max">-- V</b></div>
+          <div><span>最高时刻</span><b id="energy-pv-max-ts">--</b></div>
+          <div><span>最低</span><b id="energy-pv-min">-- V</b></div>
+          <div><span>最低时刻</span><b id="energy-pv-min-ts">--</b></div>
+          <div><span>平均</span><b id="energy-pv-avg">-- V</b></div>
+        </div>
+      </div>
+      <div class="card">
+        <div class="card-title">采样情况</div>
+        <div class="kv-list">
+          <div><span>采样点数</span><b id="energy-count">--</b></div>
+          <div><span>采样间隔</span><b id="energy-sample-info">--</b></div>
+          <div><span>保留天数</span><b id="energy-retention-info">--</b></div>
+          <div><span>记录起止</span><b id="energy-span">--</b></div>
+        </div>
+        <p class="muted small" id="energy-note">电压原先不落库，历史无法回溯；时间轴从启用采样后开始积累。</p>
+      </div>
+    </div>
+    <div class="card mt">
+      <div class="row gap" style="justify-content:space-between;align-items:center">
+        <div class="card-title" style="margin:0">全日电压时间轴</div>
+        <div class="muted small">
+          <span class="energy-dot" style="background:#f5a623"></span> 电池
+          <span class="energy-dot" style="background:#3b82f6;margin-left:10px"></span> 光伏
+          <span style="margin-left:10px">鼠标悬停查看该处数值</span>
+        </div>
+      </div>
+      <div class="energy-wrap">
+        <canvas id="energy-chart"></canvas>
+        <div class="energy-tip hidden" id="energy-tip"></div>
+      </div>
+    </div>
+  </div><!-- /#ov-energy -->
 </section>
 
 <!-- 网页对讲 -->
@@ -104,15 +195,6 @@
       </div>
       <p class="muted small">录音完成后自动发送到开发板 3.5mm AUX 输出。通过局域网 HTTP 访问时可用“上传 WAV 测试”验证 AUX 输出。</p>
       <div class="meter"><span id="record-meter" style="width:0%"></span></div>
-    </div>
-    <div class="card">
-      <div class="card-title">录音记录</div>
-      <div class="table-wrap">
-        <table class="data-table" id="recordings-table">
-          <thead><tr><th>时间</th><th>用户</th><th>时长</th><th>大小</th><th>操作</th></tr></thead>
-          <tbody><tr><td colspan="5" class="muted">暂无录音</td></tr></tbody>
-        </table>
-      </div>
     </div>
   </div>
   <div class="card mt">
@@ -206,15 +288,12 @@
       </div>
       <div class="row gap tts-bar">
         <span class="badge">本地 Piper（离线）</span>
-        <select id="tts-voice" title="中文/默认音色"></select>
-        <select id="tts-en-voice" title="英文片段音色（中英混读时使用）"></select>
-        <label class="checkline" title="呼号与单字母按 ICAO 字母解释法朗读：BG7XYZ -> Bravo Golf Seven X-ray Yankee Zulu"><input type="checkbox" id="tts-icao" checked> ICAO</label>
+        <span class="muted small">音色 / 英文音色 / ICAO / 流式朗读策略统一在「设置 / 校准」配置，全局生效</span>
         <input id="tts-test-text" placeholder="TTS 测试文本" value="呼号 BG7XYZ，这里是 ELF2 中继站，Radio check five nine，how copy？">
         <button class="btn ghost" id="btn-tts-test">测试朗读（板端 AUX）</button>
         <button class="btn primary" id="btn-tts-test-web">朗读到网页</button>
         <button class="btn ghost" id="btn-tts-stop">停止朗读</button>
-        <label class="checkline"><input type="checkbox" id="tts-auto-speak"> 自动朗读 LLM 回复</label>
-        <span id="tts-stream-status" class="muted small">流式朗读：未启动</span>
+        <span id="tts-stream-status" class="muted small">流式朗读：{% if tts_auto_speak %}策略已开{% else %}策略关闭{% endif %}</span>
       </div>
       <div class="row gap mt">
         <audio id="tts-audio" controls preload="none" style="width:100%;max-width:520px"></audio>
@@ -707,8 +786,18 @@
 
 <!-- 设置 / 校准 -->
 <section id="tab-settings" class="tab-panel admin-only">
-  <div class="panel-head"><h2>设置与电压校准</h2><span class="muted">仅管理员可修改</span></div>
-  <div class="grid grid-2">
+  <div class="panel-head">
+    <h2>设置与电压校准</h2>
+    <div class="row gap">
+      <button class="btn ghost btn-sm" id="btn-acc-expand">全部展开</button>
+      <button class="btn ghost btn-sm" id="btn-acc-collapse">全部收起</button>
+      <span class="muted small">仅管理员可修改 · 按分类收纳，点标题栏展开/收起（状态会记住）</span>
+    </div>
+  </div>
+
+  <details class="acc" open data-acc="hw">
+    <summary><b>① 硬件校准与射频</b><span class="acc-sub">电压校准 · PTT 发射自检 · BUSY 接收状态</span></summary>
+    <div class="grid grid-2">
     <div class="card">
       <div class="card-title">电压校准（RK3588 SARADC 12bit · 0~1.8V）</div>
       <div class="cal-row">
@@ -744,6 +833,27 @@
         <button class="btn primary" id="btn-save-cal">保存校准</button>
         <button class="btn ghost" id="btn-cal-design">填入设计值（电池 10.11 / 光伏 17.01）</button>
       </div>
+      <div class="cal-row mt" style="border-top:1px solid var(--border);padding-top:12px">
+        <div>
+          <label>能量统计：采样间隔（秒）</label>
+          <input id="energy-sample-sec" type="number" min="10" max="600" step="10">
+        </div>
+        <div>
+          <label>采样保留（天）</label>
+          <input id="energy-retention-days" type="number" min="1" max="3650" step="30">
+        </div>
+        <div>
+          <label>电压采样落库</label>
+          <select id="energy-log-enabled">
+            <option value="1">开启（推荐）</option>
+            <option value="0">关闭</option>
+          </select>
+        </div>
+      </div>
+      <div class="row gap mt">
+        <button class="btn primary" id="btn-save-energy">保存能量统计设置</button>
+        <span class="muted small">关掉就不再写新采样；总览「能量统计」时间轴靠这些采样绘制</span>
+      </div>
     </div>
     <div class="card" id="ptt-diag-card">
       <div class="card-title">PTT 发射自检（硬件排查 · 不接音频）</div>
@@ -773,6 +883,12 @@
         注意 3.3V 数字输入的低电平判据 VIL≈0.99V，若触发时只能拉到约 2.7V 会被读成高电平，
         需要加大光耦驱动电流或在 GPIO 侧加对地下拉。下方「原始电平 / 电平变化次数」可直接判断接线是否有效。</p>
     </div>
+    </div>
+  </details>
+
+  <details class="acc" open data-acc="llm">
+    <summary><b>② 音频 · LLM · 语音</b><span class="acc-sub">全局音量 · LLM 提供商 · 提示词/Agent · TTS 音色与流式朗读</span></summary>
+    <div class="grid grid-2">
     <div class="card">
       <div class="card-title">系统全局音量</div>
       <div class="row gap">
@@ -788,7 +904,7 @@
       <div class="kv-list mt" id="audio-mixer-status"><span class="muted">读取中…</span></div>
       <p class="muted small">控制 NAU88C22 Headphone 与 Speaker 输出，作用于开发板 3.5mm AUX 全局播放。</p>
     </div>
-    <div class="card">
+    <div class="card" id="llm-set-card">
       <div class="card-title">LLM / 页面设置</div>
       <label>默认提供商</label>
       <select id="set-llm-provider"><option value="local">本地模型</option><option value="external">外部 API</option></select>
@@ -805,7 +921,10 @@
       <label>外部 API Key</label>
       <input id="set-ext-key" type="password" placeholder="sk-...">
       <label class="checkline"><input type="checkbox" id="set-auto-play" checked> 对讲录音上传后自动播放到 AUX</label>
-      <button class="btn primary" id="btn-save-settings">保存设置</button>
+      <div class="row gap mt">
+        <button class="btn primary" id="btn-save-settings">保存 LLM / 页面设置</button>
+        <span class="muted small" id="llm-save-state">已保存</span>
+      </div>
     </div>
     <div class="card" id="llm-agent-card">
       <div class="card-title">LLM 提示词注入 / Agent 技能 / 生成速率</div>
@@ -837,7 +956,7 @@
         <button class="btn ghost" id="btn-clear-stats">清空统计</button>
       </div>
     </div>
-    <div class="card">
+    <div class="card" id="tts-set-card">
       <div class="card-title">TTS 语音朗读设置（仅本地 Piper）</div>
       <label>本地 Piper 音色（中文/默认）</label>
       <select id="set-tts-voice"></select>
@@ -846,7 +965,11 @@
       <label>ICAO 字母串专用音色（咬字清晰优先）</label>
       <select id="set-tts-icao-voice"></select>
       <label class="checkline"><input type="checkbox" id="set-tts-icao"> 呼号/单字母按 ICAO 字母解释法朗读（BG7XYZ → Bravo Golf Seven X-ray Yankee Zulu）</label>
-      <label class="checkline"><input type="checkbox" id="set-tts-auto-speak"> LLM 回复后自动朗读到 3.5mm AUX</label>
+      <label class="checkline" title="运行策略：LLM 流式输出时边出字边朗读（Piper），并保证朗读全程 PTT 使能"><input type="checkbox" id="set-tts-auto-speak"{% if tts_auto_speak %} checked{% endif %}> LLM 回复流式朗读到 3.5mm AUX（边生成边朗读）</label>
+      <div class="row gap mt">
+        <button class="btn primary" id="btn-save-tts">保存语音设置</button>
+        <span class="muted small" id="tts-save-state">已保存</span>
+      </div>
       <hr class="sep">
       <div class="card-title">音色包管理</div>
       <div class="table-wrap">
@@ -857,7 +980,7 @@
       </div>
       <div class="muted small" id="voice-manage-info">加载中…</div>
       <hr class="sep">
-      <div class="card-title">音色训练 / 上传</div>
+      <div class="card-title">音色包部署</div>
       <label>音色包 zip（包含 model.onnx 与 model.onnx.json）</label>
       <input type="file" id="tts-voice-zip" accept=".zip,application/zip">
       <label>音色 ID</label>
@@ -865,15 +988,14 @@
       <button class="btn ghost" id="btn-tts-voice-upload">上传音色包</button>
       <div class="meter mt"><span id="voice-upload-bar" style="width:0%"></span></div>
       <div class="muted small" id="voice-upload-info">未上传（音色包约 56MB，上传中请勿关闭页面）</div>
-      <label>训练数据 zip（上传到 /opt/ai/voice_training）</label>
-      <input type="file" id="tts-train-zip" accept=".zip,application/zip">
-      <label>数据集 ID</label>
-      <input id="tts-train-id" placeholder="例如 voice_dataset_01">
-      <button class="btn ghost" id="btn-tts-train-upload">上传训练数据</button>
-      <div class="meter mt"><span id="train-upload-bar" style="width:0%"></span></div>
-      <div class="muted small" id="train-upload-info">未上传</div>
-      <p class="muted small">RK3588 板端不直接训练大模型；训练在 PC/服务器完成后，将导出的 Piper ONNX 音色包上传即可部署。GPT-SoVITS 等方案建议在 PC 侧完成，板端只部署推理权重。</p>
+      <p class="muted small">语音训练统一在外部（PC / 服务器）完成，板端只负责部署训练好的 Piper ONNX 权重；GPT-SoVITS 等方案同样建议在 PC 侧完成。</p>
     </div>
+    </div>
+  </details>
+
+  <details class="acc" open data-acc="sensor">
+    <summary><b>③ 传感器与 RS485 总线</b><span class="acc-sub">串口总线 · 风速 · 雨量 · 温湿度</span></summary>
+    <div class="grid grid-2">
     <div class="card" style="grid-column: 1 / -1">
       <div class="card-title">RS485 总线（风速 / 雨量共用）</div>
       <div class="cal-row">
@@ -947,6 +1069,28 @@
     <p class="muted small">寄存器约定：起始寄存器为温度 raw（int16 有符号），下一个寄存器为湿度 raw（uint16），默认倍率 0.1。当前传感器暂未接线，启用后读取会返回 Modbus 超时，属正常现象。</p>
     <div class="muted small mt" id="th-sensor-status">状态：--</div>
   </div>
+  </details>
+
+  <details class="acc" open data-acc="sys">
+    <summary><b>④ 系统维护</b><span class="acc-sub">定时重启计划 · 修改当前用户密码</span></summary>
+  <div class="card mt" id="reboot-set-card">
+    <div class="card-title">定时重启计划</div>
+    <label class="checkline"><input type="checkbox" id="set-reboot-enabled"> 启用定时重启</label>
+    <label>重启时刻（每天，多个用逗号分隔，如 <code>04:00,16:00</code>）</label>
+    <input id="set-reboot-times" placeholder="04:00,16:00">
+    <div class="cal-row">
+      <div><label>重启前播报提前量（秒，0 = 不播报）</label><input id="set-reboot-notice" type="number" min="0" max="600" step="5" value="30"></div>
+      <div><label>播报文本</label><input id="set-reboot-text" maxlength="80" placeholder="中继台即将重启，请稍候。"></div>
+    </div>
+    <div class="row gap mt">
+      <button class="btn primary" id="btn-save-reboot">保存重启计划</button>
+      <button class="btn ghost" id="btn-reboot-check">测试重启权限</button>
+      <button class="btn ghost" id="btn-reboot-now" title="立即重启板卡，当前会话会断开">立即重启</button>
+      <span class="muted small" id="reboot-save-state">已保存</span>
+    </div>
+    <div class="muted small mt" id="reboot-status">—</div>
+    <p class="muted small">重启走 <code>/usr/local/sbin/elf2-reboot.sh</code> 的 sudoers 白名单（不给 elf 通用 sudo）。<b>开机不足 5 分钟不会触发</b>，避免重启后补触发滚成循环。</p>
+  </div>
   <div class="card mt">
     <div class="card-title">修改当前用户密码</div>
     <div class="row gap">
@@ -955,10 +1099,11 @@
       <button class="btn" id="btn-change-pass">修改密码</button>
     </div>
   </div>
+  </details>
 </section>
 
 {% endblock %}
 
 {% block scripts %}
-<script src="{{ url_for('static', filename='js/camera-modern.js', v='20260923a') }}"></script>
+<script src="{{ url_for('static', filename='js/camera-modern.js', v='20260930b') }}"></script>
 {% endblock %}

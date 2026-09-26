@@ -11,6 +11,75 @@ import time
 from pathlib import Path
 
 
+_SW_H264 = ('libx264', ['-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '30'])
+_H264_ENCODER_CACHE = {}
+
+# 硬件编码器（rkmpp / v4l2m2m）不支持 -crf，只能走码率控制。
+# 标定到与原先 libx264 -crf 30 相当的体积：实测 720p15 约 1.2~1.7 Mbit/s
+# （9~13 MB/分钟）。注意 -b:v 4M 会让每段涨到 ~30MB，存储直接翻三倍。
+_HW_BITRATE = (os.environ.get('RELAY_CAM_BITRATE') or '1500k').strip()
+
+
+def _encoder_works(args):
+    """试编一帧 64x64 黑场，确认这个编码器在本机真的能用。"""
+    try:
+        proc = subprocess.run(
+            ['ffmpeg', '-hide_banner', '-loglevel', 'error',
+             '-f', 'lavfi', '-i', 'testsrc=size=64x64:rate=1', '-frames:v', '1']
+            + list(args) + ['-pix_fmt', 'yuv420p', '-f', 'null', '-'],
+            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=25)
+        return proc.returncode == 0
+    except Exception:
+        return False
+
+
+def _h264_candidates():
+    """按优先级给出候选编码器。"""
+    forced = (os.environ.get('RELAY_CAM_ENCODER') or '').strip()
+    if forced:
+        return [(forced, ['-c:v', forced])]
+    if (os.environ.get('RELAY_CAM_HWENC') or '').strip() == '0':
+        return [_SW_H264]
+    try:
+        proc = subprocess.run(['ffmpeg', '-hide_banner', '-encoders'],
+                              stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                              timeout=10)
+        listing = proc.stdout.decode('utf-8', 'replace')
+    except Exception:
+        listing = ''
+    cands = []
+    if 'h264_rkmpp' in listing:
+        cands.append(('h264_rkmpp', ['-c:v', 'h264_rkmpp', '-b:v', _HW_BITRATE]))
+    if 'h264_v4l2m2m' in listing:
+        cands.append(('h264_v4l2m2m', ['-c:v', 'h264_v4l2m2m', '-b:v', _HW_BITRATE]))
+    cands.append(_SW_H264)
+    return cands
+
+
+def pick_h264_encoder():
+    """挑一个可用的 H.264 编码器，返回 (名字, ffmpeg 参数)。只探测一次。
+
+    RK3588 有硬件 H.264 编码器；用软件 libx264 会**持续吃掉约 0.8 个核**
+    （实测 1280x720@15fps 常驻编码）。但各版本 BSP 的 rkmpp 参数不一致，
+    所以这里先**试编一帧**再决定：探测到但实际不能用的话，
+    绝不拿用户的录像去冒险，直接退回 libx264。
+
+    环境变量：
+      RELAY_CAM_HWENC=0     强制软件编码
+      RELAY_CAM_ENCODER=xx  直接指定编码器，跳过探测与试编
+    """
+    if 'enc' in _H264_ENCODER_CACHE:
+        return _H264_ENCODER_CACHE['enc']
+    chosen = _SW_H264
+    for name, args in _h264_candidates():
+        if name == _SW_H264[0] or _encoder_works(args):
+            chosen = (name, args)
+            break
+    _H264_ENCODER_CACHE['enc'] = chosen
+    print('[CAM] H.264 编码器：%s' % chosen[0], flush=True)
+    return chosen
+
+
 class FfmpegRecorder:
     """从摄像头服务的 JPEG 帧队列读取，交给 ffmpeg 转码/封装/推流。"""
 
@@ -26,8 +95,7 @@ class FfmpegRecorder:
         ]
         if osd_filter:
             cmd += ['-vf', osd_filter]
-        cmd += [
-            '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '30',
+        cmd += pick_h264_encoder()[1] + [
             '-pix_fmt', 'yuv420p',
         ] + output_args
         self.proc = subprocess.Popen(
@@ -122,8 +190,14 @@ class CameraService:
         self.rtmp = None
         self.last_error = ''
         self.config = {}
-        self.cleaner_stop = threading.Event()
+        # 清理线程的停止信号必须「每代一个」：若共享同一个 Event，
+        # start_loop_cleaner() 里的 stop()->clear() 会在老线程观察到停止信号
+        # 之前就把它抹掉，老线程因此永远活着 —— 每调用一次漏一个线程，
+        # 且此后每 10s 全扫一次录像目录。实测 2 小时漏掉约 240 个线程，
+        # 把 GIL 抢死，接口从 40ms 劣化到 10~27s，重启才恢复。
+        self.cleaner_stop = None
         self.cleaner_thread = None
+        self.cleaner_cfg = None
 
     # ---- core capture ----
     def _build_capture_cmd(self, cfg):
@@ -301,24 +375,52 @@ class CameraService:
         err = rec.stop()
         return True, err or 'stopped'
 
+    def loop_cleaner_alive(self):
+        """清理线程是否真的还活着（供上层做幂等守卫）。"""
+        t = self.cleaner_thread
+        return bool(t is not None and t.is_alive())
+
     def start_loop_cleaner(self, directory, max_mb=2048, max_files=100, storage_max_mb=0):
-        self.stop_loop_cleaner()
-        self.cleaner_stop.clear()
+        """启动录像清理线程。幂等：参数没变且已在跑就复用，不重复起线程。
+
+        上层（_cam_loop_ensure）每 30s 就会调这里一次，所以这里必须是幂等的，
+        否则会变成「每 30s 漏一个线程」。
+        """
+        cfg_key = (str(directory), int(max_mb), int(max_files), int(storage_max_mb))
+        if self.loop_cleaner_alive() and self.cleaner_cfg == cfg_key:
+            return self.cleaner_thread
+        self.stop_loop_cleaner()          # 收干净旧线程（含 join）
+        stop = threading.Event()          # 本代专属信号，杜绝与下一代串扰
+        self.cleaner_stop = stop
+        self.cleaner_cfg = cfg_key
 
         def _clean():
-            while not self.cleaner_stop.is_set():
+            while not stop.is_set():
                 try:
                     clean_loop_dir(directory, max_mb, max_files, storage_max_mb)
                 except Exception:
                     pass
-                self.cleaner_stop.wait(10)
+                stop.wait(10)
 
-        self.cleaner_thread = threading.Thread(target=_clean, daemon=True)
-        self.cleaner_thread.start()
+        t = threading.Thread(target=_clean, daemon=True, name='cam-cleaner')
+        self.cleaner_thread = t
+        t.start()
+        return t
 
     def stop_loop_cleaner(self):
-        self.cleaner_stop.set()
+        """停止清理线程，并等它真正退出。
+
+        只 set() 而不 join 会留下僵尸线程：老代码紧接着就 clear()，
+        老线程永远等不到停止信号。
+        """
+        ev, t = self.cleaner_stop, self.cleaner_thread
+        self.cleaner_stop = None
         self.cleaner_thread = None
+        self.cleaner_cfg = None
+        if ev is not None:
+            ev.set()
+        if t is not None and t.is_alive():
+            t.join(timeout=2.0)
 
     def status(self):
         with self.lock:
@@ -383,17 +485,21 @@ def clean_loop_dir(directory, max_mb=2048, max_files=100, storage_max_mb=0):
         max_mb = int(float(max_mb or 0))
     except Exception:
         max_mb = 0
-    loop_limit = max(0, max_mb) * 1024 * 1024
-    loop_total = 0
-    for p in loop_files:
-        st = _safe_stat(p)
-        if st:
-            loop_total += st.st_size
-    while loop_files and loop_total > loop_limit:
-        freed = _unlink_recording(loop_files.pop(0), deleted)
-        if not freed:
-            break
-        loop_total -= freed
+    # max_mb <= 0 视作「不限」，与上面的 max_files、下面的 storage_max_mb 保持一致。
+    # 原先是 max(0, max_mb) * 1MB → 0，再用 loop_total > 0 判断，会把循环录像
+    # **全部删光**；设 0 的本意显然是不限制，而不是清空。
+    if max_mb > 0:
+        loop_limit = max_mb * 1024 * 1024
+        loop_total = 0
+        for p in loop_files:
+            st = _safe_stat(p)
+            if st:
+                loop_total += st.st_size
+        while loop_files and loop_total > loop_limit:
+            freed = _unlink_recording(loop_files.pop(0), deleted)
+            if not freed:
+                break
+            loop_total -= freed
     # 总存储容量上限：只清循环分片和快照，保护手动录像
     try:
         storage_max_mb = int(float(storage_max_mb or 0))

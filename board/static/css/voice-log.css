@@ -38,7 +38,8 @@
 }
 .vlog-tl-block {
   position: absolute; top: 6px; bottom: 6px; border-radius: 3px;
-  min-width: 2px; cursor: pointer; opacity: .85;
+  /* 缩到很窄区间时仍保证每条可点（作者确认的最小可见宽度） */
+  min-width: 3px; cursor: pointer; opacity: .85;
   background: var(--vlog-empty);
 }
 .vlog-tl-block:hover { opacity: 1; outline: 1px solid #fff; }
@@ -177,4 +178,64 @@
 .vlog-warn { color: #fdba74; }
 #vlog-st-level { font-variant-numeric: tabular-nums; }
 .tag.cs { background: #0f3f5c; color: #7dd3fc; font-weight: 600; }
+/* 段内 APRS 位置标记：尾音里解出的对方位置信标（呼号 + 坐标） */
+.tag.aprs-pos { background: #4c1d95; color: #ddd6fe; font-weight: 600; }
 .vlog-cs-input { min-width: 190px; max-width: 260px; }
+
+
+/* ===================== 时间轴区间缩放（range brush） =====================
+   设计：下方独立总览条始终显示全天 24h 分布，双滑块选区间 → 主时间轴按区间重映射。
+   握持区做了放大（手柄视觉 10px、命中区 18px），便于在窄屏上拖动。 */
+.vlog-tl-brush {
+  position: relative; height: 26px; margin-top: 6px;
+  background: #0d1524; border: 1px solid var(--border); border-radius: 6px;
+  cursor: crosshair; user-select: none; touch-action: none;
+}
+.vlog-tl-brush-bg { position: absolute; inset: 0; border-radius: 5px; overflow: hidden; }
+.vlog-tl-brush-bg i {
+  position: absolute; top: 3px; bottom: 3px; min-width: 1px; border-radius: 1px;
+  opacity: .75; display: block;
+}
+.vlog-tl-brush-sel {
+  position: absolute; top: 0; bottom: 0; border: 1px solid rgba(147, 197, 253, .85);
+  background: rgba(59, 130, 246, .16); border-radius: 5px; cursor: grab;
+}
+.vlog-tl-brush-sel.dragging { cursor: grabbing; }
+.vlog-tl-handle {
+  position: absolute; top: -2px; bottom: -2px; width: 18px;   /* 命中区放大 */
+  cursor: ew-resize; display: flex; align-items: center; justify-content: center;
+}
+.vlog-tl-handle[data-h="a"] { left: -9px; }
+.vlog-tl-handle[data-h="b"] { right: -9px; }
+.vlog-tl-handle::after {
+  content: ''; width: 3px; height: 16px; border-radius: 2px;
+  background: #93c5fd; box-shadow: 0 0 0 1px rgba(15, 23, 42, .8);
+}
+.vlog-tl-handle:hover::after, .vlog-tl-handle:focus::after { background: #fff; }
+.vlog-tl-handle:focus { outline: none; }
+.vlog-tl-handle:focus::after { box-shadow: 0 0 0 2px var(--primary); }
+.vlog-tl-brushrow {
+  display: flex; align-items: center; gap: 10px; margin-top: 4px; min-height: 20px;
+}
+.vlog-tl-brushrow .btn-sm { padding: 1px 8px; font-size: 11px; }
+/* 全天状态：隐藏选区边框，避免看起来像「已缩放到全天」 */
+.vlog-tl-brush.full .vlog-tl-brush-sel { border-color: transparent; background: transparent; }
+.vlog-tl-brush.full .vlog-tl-handle::after { background: #64748b; opacity: .5; }
+
+/* 总览条里的迷你色条：与主时间轴同一套分类配色 */
+.vlog-tl-brush-bg i.cat-voice { background: var(--vlog-voice); }
+.vlog-tl-brush-bg i.cat-tx { background: var(--vlog-tx); }
+.vlog-tl-brush-bg i.cat-aprs { background: var(--vlog-aprs); }
+.vlog-tl-brush-bg i.cat-tone,
+.vlog-tl-brush-bg i.cat-silence,
+.vlog-tl-brush-bg i.cat-jitter,
+.vlog-tl-brush-bg i.cat-pending,
+.vlog-tl-brush-bg i.cat-noise { background: var(--vlog-noise); }
+.vlog-tl-brush-bg i.cat-empty { background: var(--vlog-empty); }
+/* 刻度标签改为绝对定位（缩放后动态生成） */
+.vlog-tl-axis { position: relative; height: 16px; }
+.vlog-tl-axis span {
+  position: absolute; transform: translateX(-50%); white-space: nowrap;
+}
+.vlog-tl-axis span:first-child { transform: none; }
+.vlog-tl-axis span:last-child { transform: translateX(-100%); }

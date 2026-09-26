@@ -1,0 +1,9 @@
+# ELF2 中继主控：允许 elf 用户通过白名单脚本重启板卡
+#
+# 只放开这一个脚本，不给通用 sudo —— 应用即使被拿下也只能重启，不能做别的。
+# 文件权限必须是 0440 且属主 root，否则 sudo 会拒绝加载。
+#
+# 部署：
+#   install -m 440 -o root -g root 99-elf2-reboot.sudoers /etc/sudoers.d/99-elf2-reboot
+#   visudo -c
+elf ALL=(root) NOPASSWD: /usr/local/sbin/elf2-reboot.sh

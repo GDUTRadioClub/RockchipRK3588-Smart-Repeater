@@ -8,7 +8,7 @@
 
 {% block head_extra %}
 <link rel="stylesheet" href="{{ url_for('static', filename='vendor/leaflet/leaflet.css') }}">
-<link rel="stylesheet" href="{{ url_for('static', filename='css/aprs.css', v='20260925a') }}">
+<link rel="stylesheet" href="{{ url_for('static', filename='css/aprs.css', v='20260927a') }}">
 {% endblock %}
 
 {% block app_js %}{% endblock %}
@@ -121,6 +121,66 @@
     <div class="aprs-txnext">
       <strong>定时发射计划</strong>
       <div id="tx-next" class="muted small">—</div>
+      <div class="aprs-sched" id="tx-sched-edit" hidden>
+        <div class="sched-row" data-pt="weather">
+          <span class="sched-name">气象包 <code>_WX</code></span>
+          <label class="chk"><input type="checkbox" class="sched-en"> 启用</label>
+          <span class="sched-iv">
+            <input class="input-sm sched-num" type="number" min="1" step="1" inputmode="numeric">
+            <select class="select-sm sched-unit">
+              <option value="60">分钟</option>
+              <option value="1">秒</option>
+              <option value="3600">小时</option>
+            </select>
+          </span>
+          <span class="sched-now muted small">—</span>
+        </div>
+        <div class="sched-row" data-pt="position">
+          <span class="sched-name">位置信标 <code>!</code></span>
+          <label class="chk"><input type="checkbox" class="sched-en"> 启用</label>
+          <span class="sched-iv">
+            <input class="input-sm sched-num" type="number" min="1" step="1" inputmode="numeric">
+            <select class="select-sm sched-unit">
+              <option value="60">分钟</option>
+              <option value="1">秒</option>
+              <option value="3600">小时</option>
+            </select>
+          </span>
+          <span class="sched-now muted small">—</span>
+        </div>
+        <div class="sched-row" data-pt="telemetry">
+          <span class="sched-name">遥测 <code>T#</code></span>
+          <label class="chk"><input type="checkbox" class="sched-en"> 启用</label>
+          <span class="sched-iv">
+            <input class="input-sm sched-num" type="number" min="1" step="1" inputmode="numeric">
+            <select class="select-sm sched-unit">
+              <option value="60">分钟</option>
+              <option value="1">秒</option>
+              <option value="3600">小时</option>
+            </select>
+          </span>
+          <span class="sched-now muted small">—</span>
+        </div>
+        <div class="sched-row" data-pt="status">
+          <span class="sched-name">状态 <code>&gt;</code></span>
+          <label class="chk"><input type="checkbox" class="sched-en"> 启用</label>
+          <span class="sched-iv">
+            <input class="input-sm sched-num" type="number" min="1" step="1" inputmode="numeric">
+            <select class="select-sm sched-unit">
+              <option value="60">分钟</option>
+              <option value="1">秒</option>
+              <option value="3600">小时</option>
+            </select>
+          </span>
+          <span class="sched-now muted small">—</span>
+        </div>
+        <div class="sched-actions">
+          <button class="btn primary btn-sm" id="btn-sched-save">保存发射计划</button>
+          <button class="btn ghost btn-sm" id="btn-sched-all-on">全部开启</button>
+          <button class="btn ghost btn-sm" id="btn-sched-all-off">全部关闭</button>
+          <span id="tx-sched-result" class="muted small"></span>
+        </div>
+      </div>
       <label class="chk"><input type="checkbox" id="tx-force" > 忽略最短间隔限制</label>
     </div>
   </div>
@@ -195,5 +255,5 @@
 
 {% block scripts %}
 <script src="{{ url_for('static', filename='vendor/leaflet/leaflet.js') }}"></script>
-<script src="{{ url_for('static', filename='js/aprs.js', v='20260925a') }}"></script>
+<script src="{{ url_for('static', filename='js/aprs.js', v='20260930b') }}"></script>
 {% endblock %}

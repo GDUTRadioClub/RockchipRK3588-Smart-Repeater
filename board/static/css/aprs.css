@@ -98,6 +98,23 @@
 .aprs-txresult code { background: rgba(255,255,255,.08); padding: 2px 6px; border-radius: 4px;
   font-size: 12px; word-break: break-all; }
 .aprs-txnext { margin-top: 16px; padding-top: 12px; border-top: 1px solid rgba(255,255,255,.08); }
+.aprs-sched { display: block; margin: 10px 0; padding: 10px; border-radius: 6px;
+  background: rgba(255,255,255,.03); border: 1px solid rgba(255,255,255,.06); }
+.aprs-sched .input-sm { width: 84px; }
+.aprs-sched .select-sm { min-width: 76px; }
+.sched-row { display: grid; grid-template-columns: minmax(120px, 1fr) auto auto auto;
+  gap: 10px; align-items: center; padding: 5px 0; }
+.sched-row + .sched-row { border-top: 1px solid rgba(255,255,255,.05); }
+.sched-name { font-size: 13px; white-space: nowrap; }
+.sched-name code { font-size: 11px; opacity: .7; }
+.sched-iv { display: inline-flex; gap: 6px; align-items: center; }
+.sched-now { min-width: 104px; text-align: right; white-space: nowrap; }
+.sched-actions { display: flex; flex-wrap: wrap; gap: 8px; align-items: center;
+  margin-top: 10px; padding-top: 10px; border-top: 1px solid rgba(255,255,255,.08); }
+@media (max-width: 720px) {
+  .sched-row { grid-template-columns: 1fr auto; }
+  .sched-now { text-align: left; }
+}
 
 /* ---------- 表格 ---------- */
 .aprs-scroll { max-height: 420px; overflow: auto; }
