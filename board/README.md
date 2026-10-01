@@ -168,10 +168,10 @@ http://192.168.101.215:8080
 | `/api/llm/stats` | GET | LLM 生成速率统计（最近 N 次 + 今日汇总）；`DELETE` 清空（管理员） |
 | `/api/agent/tools` | GET | 技能/工具清单、启用状态、提示词实时变量 |
 | `/api/agent/chat` | POST | 类 Agent 对话（SSE：`iter/delta/tool_start/tool_result/usage/usage_total`） |
-| `/api/intercom/upload` | POST | 上传 WAV 并播放到 AUX |
+| `/api/intercom/upload` | POST | 上传 WAV 并**发射**（默认拉 PTT；`dry=1` 只送 AUX 不发射） |
 | `/api/intercom/recordings` | GET | 录音记录 |
-| `/api/intercom/play/<id>` | POST | 重放录音 |
-| `/api/intercom/test-tone` | POST | 播放测试音 |
+| `/api/intercom/play/<id>` | POST | 重放录音并**发射**（`dry=1` 只本地放音） |
+| `/api/intercom/test-tone` | POST | 播放测试音并**发射**（`dry=1` 只本地放音） |
 | `/api/mic/settings` | GET/POST | 麦克风输入源、监听声道、PGA/ADC/Boost 增益 |
 | `/api/mic/capture/start` | POST | 开始采集开发板 3.5mm 麦克风输入 |
 | `/api/mic/capture/stop` | POST | 停止采集 |

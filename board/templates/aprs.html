@@ -233,9 +233,10 @@
   <!-- 本站位置 -->
   <div class="aprs-pane" data-apane="cfg" hidden>
     <p class="muted small">
-      本站坐标是信标与气象包的来源。<b>天地图为 CGCS2000 坐标系，与 WGS-84 实用精度一致
-      （差 &lt;1m），因此 APRS 的 WGS-84 坐标可直接绘制，无需 GCJ-02 偏移转换。</b>
-      后续接入 ZED-F9P RTK 基准站时，把「位置来源」改成 nmea 并填串口即可，其余无需改动。
+      本站坐标是信标与气象包的来源。位置可以来自<b>板上 GNSS 模块</b>（u-blox ZED-F9P，
+      USB 口只吐 UBX 二进制，选「GNSS」会自动识别 NMEA/UBX），也可以<b>直接填固定坐标</b>。
+      <b>天地图为 CGCS2000 坐标系，与 WGS-84 实用精度一致（差 &lt;1m），因此 APRS 的 WGS-84
+      坐标可直接绘制，无需 GCJ-02 偏移转换。</b>
     </p>
     <div class="aprs-form">
       <label>呼号 <input id="cfg-call" class="input-sm" maxlength="6"></label>
@@ -244,18 +245,37 @@
       <label>经度 <input id="cfg-lon" class="input-md" placeholder="114.050000"></label>
       <label>海拔 m <input id="cfg-alt" class="input-sm" placeholder="（可空）"></label>
       <label>状态注释 <input id="cfg-comment" class="input-lg" maxlength="60"></label>
+    </div>
+    <div class="aprs-form">
+      <label>位置来源
+        <select id="cfg-pos-source-sel" class="input-md">
+          <option value="manual">手动固定坐标</option>
+          <option value="gnss">GNSS（自动识别 NMEA / UBX）</option>
+          <option value="ubx">GNSS · 仅 UBX（ZED-F9P 默认）</option>
+          <option value="nmea">GNSS · 仅 NMEA</option>
+        </select>
+      </label>
+      <label>GNSS 串口 <input id="cfg-gps-port" class="input-md" placeholder="/dev/ttyACM0"></label>
+      <label>波特率 <input id="cfg-gps-baud" class="input-sm" type="number" min="1200"
+                        max="921600" step="1200" placeholder="38400"></label>
+      <label>水平精度门限 m <input id="cfg-gnss-hacc" class="input-sm" type="number"
+                            min="0" max="10000" placeholder="100（0=不限）"></label>
       <button class="btn primary" id="btn-cfg-save">保存并定位</button>
+      <button class="btn" id="btn-gnss-read">读取一次</button>
       <span id="cfg-result" class="muted small"></span>
     </div>
     <div class="muted small">
-      位置来源：<b id="cfg-pos-source">manual</b> ·
-      <span id="cfg-pos-stat">—</span>
+      位置来源：<b id="cfg-pos-source">manual</b> · <span id="cfg-pos-stat">—</span>
     </div>
+    <p class="muted small">
+      GNSS 取不到合格定位时，信标/气象会回落到上面的固定坐标（原因显示在这一行）。
+      「水平精度门限」用来挡住差定位——发出去的坐标就是别人眼里的"你在哪"，超门限宁可不发。
+    </p>
   </div>
 </div>
 {% endblock %}
 
 {% block scripts %}
 <script src="{{ url_for('static', filename='vendor/leaflet/leaflet.js') }}"></script>
-<script src="{{ url_for('static', filename='js/aprs.js', v='20260930b') }}"></script>
+<script src="{{ url_for('static', filename='js/aprs.js', v='20260930d') }}"></script>
 {% endblock %}

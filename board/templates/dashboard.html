@@ -19,16 +19,18 @@
   .sub-tab-btn.active { color: var(--fg); border-bottom-color: #4a6cf7; font-weight: 600; }
   .sub-panel { display: none; }
   .sub-panel.active { display: block; }
-  /* 能量统计：画布 + 悬停提示 */
-  .energy-wrap { position: relative; }
+  /* 图表画布 + 悬停提示：能量时间轴与风力时间轴共用同一套视觉语言。
+     .chart-* 是通用别名，样式与 .energy-* 同源，避免两处各写一份。 */
+  .energy-wrap, .chart-wrap { position: relative; }
   #energy-chart { width: 100%; height: 260px; display: block; border-radius: 8px; }
-  .energy-tip { position: absolute; pointer-events: none; z-index: 5;
+  .chart-canvas { width: 100%; display: block; border-radius: 8px; }
+  .energy-tip, .chart-tip { position: absolute; pointer-events: none; z-index: 5;
                 background: rgba(13, 21, 38, .96); border: 1px solid #26334d;
                 border-radius: 8px; padding: 7px 10px; font-size: 12px; line-height: 1.5;
                 color: #e6edf7; white-space: nowrap; box-shadow: 0 6px 20px rgba(0,0,0,.45); }
-  .energy-tip.hidden { display: none; }
-  .energy-tip b { font-variant-numeric: tabular-nums; }
-  .energy-dot { display: inline-block; width: 9px; height: 9px; border-radius: 2px; }
+  .energy-tip.hidden, .chart-tip.hidden { display: none; }
+  .energy-tip b, .chart-tip b { font-variant-numeric: tabular-nums; }
+  .energy-dot, .chart-dot { display: inline-block; width: 9px; height: 9px; border-radius: 2px; }
 </style>
 {% endblock %}
 {% block content %}
@@ -222,7 +224,8 @@
         <input type="file" id="wav-file" accept="audio/wav,.wav" style="flex:1">
         <button class="btn ghost" id="btn-upload-wav">上传 WAV 测试</button>
       </div>
-      <p class="muted small">录音完成后自动发送到开发板 3.5mm AUX 输出。通过局域网 HTTP 访问时可用“上传 WAV 测试”验证 AUX 输出。</p>
+      <label class="checkline" title="勾选（默认）：先拉 PTT 再出声，音频经 3.5mm AUX 由电台发射；取消：只送 AUX 不 key 电台，用于不发射的台面试听/校准"><input type="checkbox" id="record-tx-ptt" checked> 发射（拉 PTT）</label>
+      <p class="muted small">这三个动作默认<b>先拉 PTT 再出声</b>（前导 0.3s 等电台起键，避免首字被吃掉），音频送开发板 3.5mm AUX 后由电台发射；取消上面的勾选则只本地放音、不 key 电台。</p>
       <div class="meter"><span id="record-meter" style="width:0%"></span></div>
     </div>
   </div>
@@ -729,8 +732,18 @@
     </div>
   </div>
   <div class="card mt">
-    <div class="card-title">当日风力时间轴 <span class="muted small" id="weather-chart-date"></span></div>
-    <canvas id="weather-chart" height="220" style="width:100%;height:220px"></canvas>
+    <div class="row gap" style="justify-content:space-between;align-items:center">
+      <div class="card-title" style="margin:0">当日风力时间轴 <span class="muted small" id="weather-chart-date"></span></div>
+      <div class="muted small">
+        <span class="chart-dot" style="background:#3b82f6"></span> 平均风速
+        <span class="chart-dot" style="background:#ef4444;margin-left:10px"></span> 最大风速
+        <span style="margin-left:10px">鼠标悬停查看该处数值</span>
+      </div>
+    </div>
+    <div class="chart-wrap">
+      <canvas id="weather-chart" class="chart-canvas" height="220" style="width:100%;height:220px"></canvas>
+      <div class="chart-tip hidden" id="weather-tip"></div>
+    </div>
   </div>
   <div class="card mt">
     <div class="card-title">历史数据查询与导出</div>
@@ -755,7 +768,15 @@
       <button class="btn ghost" id="btn-weather-export">导出 CSV</button>
       <span class="muted small" id="weather-history-hint"></span>
     </div>
-    <canvas id="weather-history-chart" height="220" style="width:100%;height:220px;margin-top:10px"></canvas>
+    <div class="muted small" style="margin-top:8px">
+      <span class="chart-dot" style="background:#3b82f6"></span> 平均风速
+      <span class="chart-dot" style="background:#ef4444;margin-left:10px"></span> 最大风速
+      <span style="margin-left:10px">鼠标悬停查看该处数值</span>
+    </div>
+    <div class="chart-wrap" style="margin-top:10px">
+      <canvas id="weather-history-chart" class="chart-canvas" height="220" style="width:100%;height:220px"></canvas>
+      <div class="chart-tip hidden" id="weather-history-tip"></div>
+    </div>
   </div>
 </section>
 

@@ -1060,8 +1060,10 @@
       const blob = encodeWav(samples, recordSampleRate);
       const fd = new FormData();
       fd.append('audio', blob, 'web_intercom.wav');
+      if (!recordTxEnabled()) fd.append('dry', '1');
       const data = await apiFetch('/api/intercom/upload', { method: 'POST', body: fd });
-      showToast(`录音已上传：${data.duration_ms} ms，${(data.size / 1024).toFixed(1)} KB`, 'success');
+      showToast(`${recordTxToast(data, '录音')}（${data.duration_ms} ms，${(data.size / 1024).toFixed(1)} KB）`,
+                recordTxOk(data) ? 'success' : 'error');
       $('#record-status').textContent = '录音已上传';
     } catch (e) {
       showToast('录音上传失败：' + e.message, 'error');
@@ -1205,10 +1207,30 @@
     if (info) info.textContent = `本次推送 ${(pushBytes / 1024).toFixed(0)} KB；松开按钮或 5 秒无数据，板端会自动释放 PTT。`;
   }
 
+  // 对讲控制的三个播放动作（测试音 / 录音上传 / 上传 WAV）默认**发射**：
+  // 勾选「发射（拉 PTT）」时板端先拉 PTT 再出声；取消勾选则以 dry=1 只送 AUX 本地放音。
+  function recordTxEnabled() {
+    const el = $('#record-tx-ptt');
+    return el ? !!el.checked : true;
+  }
+
+  function recordTxToast(data, what) {
+    const ptt = (data && data.ptt) || {};
+    if (data && data.tx === false) return what + '已送到 AUX（未发射）';
+    if (ptt.high) return what + '已发射：PTT 已拉高（GPIO ' + ptt.gpio + '）';
+    return what + '已送 AUX，但 PTT 未拉高' + (ptt.error ? ('：' + ptt.error) : '');
+  }
+
+  function recordTxOk(data) {
+    return !!(data && ((data.ptt && data.ptt.high) || data.tx === false));
+  }
+
   async function playTestTone() {
     try {
-      const data = await apiFetch('/api/intercom/test-tone', { method: 'POST', body: '{}' });
-      showToast('测试音已发送到 ' + data.device, 'success');
+      const data = await apiFetch('/api/intercom/test-tone', {
+        method: 'POST', body: JSON.stringify({ dry: !recordTxEnabled() }),
+      });
+      showToast(recordTxToast(data, '测试音'), recordTxOk(data) ? 'success' : 'error');
     } catch (e) { showToast(e.message, 'error'); }
   }
 
@@ -1666,6 +1688,132 @@
     window.location.href = `/api/rain/export.csv?date=${encodeURIComponent(date)}`;
   }
 
+  // ---------------- 图表悬停：竖向准线 + 数值点 + 浮层 ----------------
+  // 与「总览 - 能量统计 - 全日电压时间轴」共用同一套视觉语言：同底色/网格、
+  // 悬停画竖向准线并在每条曲线上标点、浮层样式与 .energy-tip 同源
+  // （见 dashboard.html 里的 .chart-tip 别名）。原先这套交互只有能量图有，
+  // 风力时间轴是「裸画布」，所以把它抽成公用件，两边口径一致。
+  const WIND_AVG_COLOR = '#3b82f6';   // 与卡片标题行图例的色块保持一致
+  const WIND_MAX_COLOR = '#ef4444';
+  const windCharts = new Map();       // canvas 选择器 -> 悬停状态
+
+  function windChartState(selector, tipSel) {
+    if (!windCharts.has(selector)) {
+      windCharts.set(selector, { hover: -1, box: null, points: [], ticks: [],
+                                 maxV: 1, emptyText: '', tipSel: '' });
+    }
+    const st = windCharts.get(selector);
+    if (tipSel) st.tipSel = tipSel;
+    return st;
+  }
+
+  function chartHideTip(tipSel) {
+    const t = tipSel && $(tipSel);
+    if (t) t.classList.add('hidden');
+  }
+
+  function chartShowTip(tipSel, box, clientX, html) {
+    const tip = tipSel && $(tipSel);
+    if (!tip || !box) return;
+    tip.innerHTML = html;
+    tip.classList.remove('hidden');
+    const wrap = tip.parentElement;
+    const wrapRect = wrap.getBoundingClientRect();
+    let left = clientX - wrapRect.left + 14;
+    if (left + tip.offsetWidth > wrap.clientWidth - 2) {
+      left = Math.max(2, left - tip.offsetWidth - 28);
+    }
+    tip.style.left = left + 'px';
+    tip.style.top = (box.pad.t + 6) + 'px';
+  }
+
+  // marks: [[y 像素, 颜色], …]；y 为 null/undefined 表示该点无数据，跳过不标
+  function drawChartCrosshair(ctx, box, x, marks) {
+    ctx.strokeStyle = '#8fa2c4';
+    ctx.globalAlpha = 0.6;
+    ctx.beginPath();
+    ctx.moveTo(x, box.pad.t);
+    ctx.lineTo(x, box.pad.t + box.ch);
+    ctx.stroke();
+    ctx.globalAlpha = 1;
+    (marks || []).forEach(m => {
+      if (!m || m[0] === null || m[0] === undefined) return;
+      ctx.fillStyle = m[1];
+      ctx.beginPath();
+      ctx.arc(x, m[0], 3.2, 0, Math.PI * 2);
+      ctx.fill();
+    });
+  }
+
+  // X 轴刻度：把数据跨度均分若干段取下标。电压时间轴是固定 24 小时整点刻度，
+  // 风力时间轴的跨度随数据而定，所以按比例取点，观感与它一致。
+  function windTickIndexes(n, segments = 6) {
+    if (!n) return [];
+    const segs = Math.max(1, Math.min(segments, Math.max(1, n - 1)));
+    const out = [];
+    for (let k = 0; k <= segs; k++) {
+      const i = n === 1 ? 0 : Math.round((n - 1) * k / segs);
+      if (out.indexOf(i) < 0) out.push(i);
+    }
+    return out;
+  }
+
+  function windFmt(v, digits = 1) {
+    if (v === null || v === undefined || v === '') return '--';
+    const num = Number(v);
+    return isFinite(num) ? num.toFixed(digits) + ' m/s' : '--';
+  }
+
+  // 悬停浮层正文：**两个数据都要点名**（平均 / 最大），再补最小与样本数
+  function windTipHtml(p) {
+    if (!p) return '';
+    const bits = ['<b>' + (p.minute || p.ts || '') + '</b>'];
+    bits.push('<span style="color:' + WIND_AVG_COLOR + '">平均风速</span> <b>'
+              + windFmt(p.avg_speed) + '</b>');
+    const mx = (p.max_speed === null || p.max_speed === undefined) ? p.avg_speed : p.max_speed;
+    bits.push('<span style="color:' + WIND_MAX_COLOR + '">最大风速</span> <b>'
+              + windFmt(mx) + '</b>');
+    if (p.min_speed !== null && p.min_speed !== undefined) {
+      bits.push('<span style="opacity:.7">本桶最小 ' + windFmt(p.min_speed) + '</span>');
+    }
+    const n = (p.n === null || p.n === undefined) ? p.count : p.n;
+    if (n !== null && n !== undefined) {
+      bits.push('<span style="opacity:.7">' + n + ' 个采样</span>');
+    }
+    return bits.join('<br>');
+  }
+
+  function windNearestIndex(clientX, st, canvas) {
+    const b = st && st.box;
+    if (!b || !st.points.length) return -1;
+    const rect = canvas.getBoundingClientRect();
+    const px = clientX - rect.left;
+    let bi = -1;
+    let bd = Infinity;
+    st.points.forEach((p, i) => {
+      const d = Math.abs(b.xOf(i) - px);
+      if (d < bd) { bd = d; bi = i; }
+    });
+    return bi;
+  }
+
+  function bindWindChartHover(canvasSel, tipSel) {
+    const cv = $(canvasSel);
+    if (!cv) return;
+    const st = windChartState(canvasSel, tipSel);
+    const redraw = () => drawWeatherChart(st.points, canvasSel, st.emptyText || '暂无数据');
+    cv.addEventListener('mousemove', ev => {
+      const i = windNearestIndex(ev.clientX, st, cv);
+      if (i < 0) { chartHideTip(st.tipSel); return; }
+      if (i !== st.hover) { st.hover = i; redraw(); }
+      chartShowTip(st.tipSel, st.box, ev.clientX, windTipHtml(st.points[i]));
+    });
+    cv.addEventListener('mouseleave', () => {
+      if (st.hover !== -1) { st.hover = -1; redraw(); }
+      chartHideTip(st.tipSel);
+    });
+  }
+
   function drawRainChart(points) {
     const canvas = $('#rain-hourly-chart');
     if (!canvas) return;
@@ -1726,6 +1874,9 @@
   function drawWeatherChart(points, selector = '#weather-chart', emptyText = '暂无数据') {
     const canvas = $(selector);
     if (!canvas) return;
+    const st = windChartState(selector);
+    st.points = points || [];
+    st.emptyText = emptyText;
     const dpr = window.devicePixelRatio || 1;
     const w = canvas.clientWidth || 800;
     const h = 220;
@@ -1739,56 +1890,84 @@
     const pad = { l: 42, r: 12, t: 14, b: 26 };
     const cw = Math.max(10, w - pad.l - pad.r);
     const ch = h - pad.t - pad.b;
+    const n = st.points.length;
+    const xOf = i => n <= 1 ? pad.l + cw / 2 : pad.l + cw * i / (n - 1);
+    st.box = { pad, cw, ch, w, h, xOf };
+    // 水平网格
     ctx.strokeStyle = '#26334d';
     ctx.lineWidth = 1;
-    ctx.beginPath();
     for (let i = 0; i <= 4; i++) {
       const y = pad.t + ch * i / 4;
-      ctx.moveTo(pad.l, y); ctx.lineTo(pad.l + cw, y);
+      ctx.beginPath(); ctx.moveTo(pad.l, y); ctx.lineTo(pad.l + cw, y); ctx.stroke();
     }
-    ctx.stroke();
-    if (!points.length) {
+    const label = (p) => ((p && (p.minute || p.ts)) || '').slice(-5);
+    // 竖向网格 + 时间刻度：与电压时间轴的整点刻度同一观感（跨度随数据而定，按比例取点）
+    const ticks = windTickIndexes(n, 6);
+    st.ticks = ticks;
+    ctx.fillStyle = '#8fa2c4';
+    ctx.font = '11px Microsoft YaHei';
+    ticks.forEach((idx, k) => {
+      const x = xOf(idx);
+      ctx.globalAlpha = (k === 0 || k === ticks.length - 1) ? 0.9 : 0.4;
+      ctx.beginPath(); ctx.moveTo(x, pad.t); ctx.lineTo(x, pad.t + ch); ctx.stroke();
+      ctx.globalAlpha = 1;
+      if (k > 0 && k < ticks.length - 1) {
+        ctx.fillText(label(st.points[idx]),
+                     Math.min(Math.max(x - 14, pad.l), pad.l + cw - 30), h - 8);
+      }
+    });
+    if (!n) {
       ctx.fillStyle = '#8fa2c4';
       ctx.font = '13px Microsoft YaHei';
       ctx.fillText(emptyText, pad.l + 10, pad.t + 22);
+      chartHideTip(st.tipSel);
       return;
     }
-    const valid = points.filter(p => p.avg_speed !== null && p.avg_speed !== undefined);
+    // X 轴首尾时间
+    ctx.fillStyle = '#8fa2c4';
+    ctx.font = '11px Microsoft YaHei';
+    ctx.fillText(label(st.points[0]), pad.l, h - 8);
+    ctx.fillText(label(st.points[n - 1]), pad.l + cw - 30, h - 8);
+    const valid = st.points.filter(p => p.avg_speed !== null && p.avg_speed !== undefined);
     const maxV = Math.max(1, ...valid.map(p => (p.max_speed ?? p.avg_speed ?? 0)));
-    const n = points.length;
-    const xOf = i => points.length === 1 ? pad.l + cw / 2 : pad.l + cw * i / (n - 1);
+    st.maxV = maxV;
     const yOf = v => pad.t + ch - ch * Math.min(1, (v || 0) / maxV);
-    // 平均线
-    ctx.strokeStyle = '#3b82f6';
+    st.yOf = yOf;
+    // 平均线（与标题行图例色块同色）
+    ctx.strokeStyle = WIND_AVG_COLOR;
     ctx.lineWidth = 2;
     ctx.beginPath();
     valid.forEach((p, i) => {
-      const idx = points.indexOf(p);
+      const idx = st.points.indexOf(p);
       const x = xOf(idx), y = yOf(p.avg_speed);
       if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
     });
     ctx.stroke();
     // 最大值线
-    ctx.strokeStyle = '#ef4444';
+    ctx.strokeStyle = WIND_MAX_COLOR;
     ctx.lineWidth = 1.5;
     ctx.beginPath();
     valid.forEach((p, i) => {
-      const idx = points.indexOf(p);
+      const idx = st.points.indexOf(p);
       const x = xOf(idx), y = yOf(p.max_speed ?? p.avg_speed);
       if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
     });
     ctx.stroke();
     // Y 轴标注
     ctx.fillStyle = '#8fa2c4';
-    ctx.font = '11px Microsoft YaHei';
     for (let i = 0; i <= 4; i++) {
       const v = maxV * (1 - i / 4);
       ctx.fillText(v.toFixed(1), 6, pad.t + ch * i / 4 + 4);
     }
-    // X 轴首尾时间
-    const label = (p) => (p.minute || p.ts || '').slice(-5);
-    ctx.fillText(label(points[0]), pad.l, h - 8);
-    ctx.fillText(label(points[n - 1]), pad.l + cw - 30, h - 8);
+    // 悬停：竖向准线 + 两条曲线上的数据点（与电压时间轴一致）
+    if (st.hover >= 0 && st.hover < n) {
+      const p = st.points[st.hover];
+      const mv = (p.max_speed === null || p.max_speed === undefined) ? p.avg_speed : p.max_speed;
+      drawChartCrosshair(ctx, st.box, xOf(st.hover), [
+        [p.avg_speed === null || p.avg_speed === undefined ? null : yOf(p.avg_speed), WIND_AVG_COLOR],
+        [mv === null || mv === undefined ? null : yOf(mv), WIND_MAX_COLOR],
+      ]);
+    }
   }
 
   // ---------------- 能量统计（电池 / 光伏电压全日时间轴） ----------------
@@ -2629,6 +2808,10 @@
     $('#btn-wind-settings-save')?.addEventListener('click', saveWeatherSettings);
     $('#btn-rain-settings-save')?.addEventListener('click', saveWeatherSettings);
     $('#weather-date')?.addEventListener('change', loadWeatherDaily);
+    // 风力时间轴 / 历史风力：悬停显示竖向准线 + 两个数据（平均 / 最大）的数值，
+    // 风格与「总览 - 能量统计 - 全日电压时间轴」一致
+    bindWindChartHover('#weather-chart', '#weather-tip');
+    bindWindChartHover('#weather-history-chart', '#weather-history-tip');
     $('#btn-rain-query')?.addEventListener('click', loadRainHourly);
     $('#btn-rain-export')?.addEventListener('click', exportRainCsv);
     $('#rain-date')?.addEventListener('change', loadRainHourly);
@@ -2696,9 +2879,11 @@
       if (!file) return showToast('请先选择一个 WAV 文件', 'error');
       const fd = new FormData();
       fd.append('audio', file, file.name || 'upload.wav');
+      if (!recordTxEnabled()) fd.append('dry', '1');
       try {
         const data = await apiFetch('/api/intercom/upload', { method: 'POST', body: fd });
-        showToast(`WAV 已上传并发送到 AUX：${data.duration_ms} ms`, 'success');
+        showToast(`${recordTxToast(data, 'WAV')}（${data.duration_ms} ms）`,
+                  recordTxOk(data) ? 'success' : 'error');
       } catch (e) { showToast(e.message, 'error'); }
     });
     $('#users-table')?.addEventListener('click', async (e) => {

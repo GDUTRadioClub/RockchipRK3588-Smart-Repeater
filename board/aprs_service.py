@@ -75,7 +75,8 @@ DEFAULTS = {
     'aprs_path': 'WIDE1-1,WIDE2-1',    # digipeater 路径；留空=不发路径
 
     # —— 位置 ——
-    'aprs_pos_source': 'manual',       # manual / nmea（ZED-F9P 预留）
+    'aprs_pos_source': 'manual',       # manual / gnss / nmea / ubx（gnss=两种协议都认）
+    'aprs_gnss_max_hacc_m': '100',     # GNSS 水平精度门限（米，0=不限）；超了不发信标
     'aprs_lat': '22.533300',
     'aprs_lon': '114.050000',
     'aprs_alt_m': '',
@@ -1225,10 +1226,13 @@ def parse_packet(pkt):
 # 五、位置来源抽象（手动固定坐标 / NMEA，ZED-F9P 预留）
 # ===========================================================================
 class PositionProvider:
-    """位置提供者。manual 走设置；nmea 走串口 GPS（ZED-F9P RTK 基准站预留）。
+    """位置提供者：手动固定坐标 / GNSS 实时定位（NMEA 或 UBX 都认）。
 
-    换 GPS 时只需把 aprs_pos_source 改成 nmea 并填 aprs_gps_port，
-    其余代码（信标、气象、遥测）无需改动。
+    `aprs_pos_source` 取 manual | gnss | nmea | ubx（gnss = 两种协议都认）。
+    读取走 `gnss_service`（自己开串口，**不依赖 pyserial**）——原实现依赖 pyserial
+    且只解析 NMEA 文本，而实测板上的 ZED-F9P 在 USB 口只吐 UBX 二进制，
+    所以那条"给 ZED-F9P 预留"的通道一直读不到东西。
+    GNSS 取不到合格定位时回落到手动坐标，并把原因留在 stat 里给页面显示。
     """
 
     def __init__(self, svc):
@@ -1237,112 +1241,99 @@ class PositionProvider:
         self.ser = None
         self.last = None
         self._open_key = None
+        self._cache_ts = 0.0
+        self._cache_val = None
+        self.cache_ttl = 5.0      # 页面轮询会频繁调 get()，GNSS 真读要限频
         self.stat = {'source': 'manual', 'ok': False, 'err': '', 'ts': 0,
                      'sats': None, 'hdop': None, 'fix': ''}
 
     def _setting(self, k, d=''):
         return self.svc.setting(k, d)
 
-    def get(self):
+    def get(self, force=False, cached_only=False):
+        """当前位置。
+
+        * 默认带 5 秒缓存：`stats_payload()` 会被页面轮询调用，每轮都真读串口会阻塞
+          2.5 秒并拖住 waitess 线程；
+        * `force=True` 立刻真读一次（页面「读取一次」与 `/api/aprs/gnss`）；
+        * `cached_only=True` **完全不读串口**：给"保存设置"这类请求用 —— 保存操作不该
+          因为读 GNSS 而卡住（实测这条路上一次请求被链路上游重置过）。
+        """
         src = (self._setting('aprs_pos_source', 'manual') or 'manual').lower()
-        if src == 'nmea':
-            r = self._from_nmea()
-            if r:
-                return r
+        gerr = ''
+        if src in ('gnss', 'nmea', 'ubx'):
+            if (not force and self._cache_val
+                    and (time.time() - self._cache_ts) < self.cache_ttl):
+                return self._cache_val
+            if cached_only and self._cache_val:
+                return self._cache_val
+            if not cached_only:
+                r = self._from_gnss(src)
+                if r:
+                    self._cache_ts, self._cache_val = time.time(), r
+                    return r
+                gerr = (self.status().get('err') or '取不到 GNSS 定位')
+            else:
+                gerr = '尚未读取 GNSS（点「读取一次」立即取一次定位）'
         lat = _f(self._setting('aprs_lat', DEFAULTS['aprs_lat']), 0.0)
         lon = _f(self._setting('aprs_lon', DEFAULTS['aprs_lon']), 0.0)
         with self.lock:
-            self.stat.update(source='manual', ok=bool(lat or lon), err='', ts=time.time())
+            # 回落也要把"为什么回落"留在 stat 里 —— 否则页面只看到 source=manual，
+            # 用户会以为是自己填的坐标在生效，而 GNSS 早就读不到了。
+            self.stat.update(source='manual', ok=bool(lat or lon),
+                             err=('GNSS 不可用，当前用固定坐标：%s' % gerr) if gerr else '',
+                             ts=time.time())
         return {'lat': lat, 'lon': lon, 'alt_m': _f(self._setting('aprs_alt_m', ''), None),
                 'source': 'manual', 'valid': True, 'ts': time.time(),
-                'sats': None, 'hdop': None, 'fix': 'manual'}
+                'sats': None, 'hdop': None, 'fix': 'manual',
+                'fallback_from': src if gerr else '', 'gnss_error': gerr}
 
-    # ---- NMEA（预留给 ZED-F9P）----
-    def _from_nmea(self):
+    # ---- GNSS（手动坐标之外的另一种位置源）----
+    def _from_gnss(self, src='gnss'):
+        import gnss_service
         port = (self._setting('aprs_gps_port', '') or '').strip()
         if not port:
             with self.lock:
-                self.stat.update(source='nmea', ok=False, err='未配置 aprs_gps_port')
+                self.stat.update(source=src, ok=False, err='未配置串口（aprs_gps_port）')
             return None
         baud = int(_f(self._setting('aprs_gps_baud', '38400'), 38400))
         try:
-            import serial
-        except Exception as e:
-            with self.lock:
-                self.stat.update(source='nmea', ok=False, err='pyserial 不可用：%s' % e)
-            return None
-        key = '%s@%d' % (port, baud)
-        if self.ser is None or self._open_key != key:
-            try:
-                if self.ser:
-                    self.ser.close()
-            except Exception:
-                pass
-            try:
-                self.ser = serial.Serial(port, baud, timeout=1.0)
-                self._open_key = key
-            except Exception as e:
-                with self.lock:
-                    self.stat.update(source='nmea', ok=False, err='打开 %s 失败：%s' % (port, e))
-                return None
-        deadline = time.time() + 2.5
-        try:
-            while time.time() < deadline:
-                line = self.ser.readline().decode('ascii', 'ignore').strip()
-                if not line.startswith('$'):
-                    continue
-                fixed = self._nmea_line(line)
-                if fixed:
-                    with self.lock:
-                        self.last = fixed
-                        self.stat.update(source='nmea', ok=True, err='', ts=time.time(),
-                                         sats=fixed.get('sats'), hdop=fixed.get('hdop'),
-                                         fix=fixed.get('fix', ''))
-                    return fixed
-        except Exception as e:
-            with self.lock:
-                self.stat.update(source='nmea', ok=False, err='%s' % e)
-            try:
-                self.ser.close()
-            except Exception:
-                pass
-            self.ser = None
-            return None
-        return self.last
-
-    @staticmethod
-    def _nmea_deg(v, hemi):
-        if not v:
-            return None
-        try:
-            dot = v.index('.')
-            deg = int(v[:dot - 2])
-            minute = float(v[dot - 2:])
+            max_hacc = float(_f(self._setting('aprs_gnss_max_hacc_m', '100'), 100) or 0)
         except Exception:
+            max_hacc = 100.0
+        fix = gnss_service.READER.read(port, baud, max_seconds=2.5, want=src)
+        st = gnss_service.READER.status()
+        if not fix:
+            with self.lock:
+                self.stat.update(source=src, ok=False,
+                                 err=st.get('err') or '没有有效定位',
+                                 proto=st.get('proto', ''), ts=st.get('ts', 0))
             return None
-        d = deg + minute / 60.0
-        return -d if hemi in ('S', 'W') else d
-
-    def _nmea_line(self, line):
-        try:
-            body = line.split('*')[0]
-            parts = body.split(',')
-            tag = parts[0][3:]
-            if tag == 'GGA' and len(parts) >= 10 and parts[6] not in ('', '0'):
-                return {'lat': round(self._nmea_deg(parts[2], parts[3]), 7),
-                        'lon': round(self._nmea_deg(parts[4], parts[5]), 7),
-                        'alt_m': _f(parts[9], None), 'sats': int(parts[7] or 0),
-                        'hdop': _f(parts[8], None), 'fix': 'GGA',
-                        'ts': time.time(), 'source': 'nmea', 'valid': True}
-            if tag == 'RMC' and len(parts) >= 8 and parts[2] == 'A':
-                return {'lat': round(self._nmea_deg(parts[3], parts[4]), 7),
-                        'lon': round(self._nmea_deg(parts[5], parts[6]), 7),
-                        'speed_kt': _f(parts[7], 0.0), 'fix': 'RMC',
-                        'ts': time.time(), 'source': 'nmea', 'valid': True}
-        except Exception:
+        ok, why = gnss_service.fix_acceptable(fix, max_hacc)
+        if not ok:
+            with self.lock:
+                self.stat.update(source=src, ok=False, err=why, proto=fix.get('proto', ''),
+                                 sats=fix.get('sats'), fix=fix.get('fix', ''),
+                                 hacc_m=fix.get('hacc_m'), ts=fix.get('ts', 0))
             return None
-        return None
+        out = {'lat': fix['lat'], 'lon': fix['lon'], 'alt_m': fix.get('alt_m'),
+               'source': src, 'valid': True, 'ts': fix.get('ts', time.time()),
+               'sats': fix.get('sats'), 'hdop': fix.get('hdop'),
+               'fix': fix.get('fix', ''), 'protocol': fix.get('proto', ''),
+               'hacc_m': fix.get('hacc_m'), 'vacc_m': fix.get('vacc_m'),
+               'carr': fix.get('carr_label', ''), 'utc': fix.get('utc', ''),
+               'max_hacc_m': max_hacc}
+        with self.lock:
+            self.last = out
+            self.stat.update(source=src, ok=True, err='', ts=out['ts'],
+                             sats=out['sats'], hdop=out['hdop'], fix=out['fix'],
+                             hacc_m=out['hacc_m'], proto=out['protocol'],
+                             carr=out.get('carr', ''))
+        return out
 
+    def status(self):
+        with self.lock:
+            return dict(self.stat)
 
 # ===========================================================================
 # 六、存储层
@@ -2227,7 +2218,7 @@ class AprsService:
         tx_today = self.store.one(
             'SELECT COUNT(*) n, SUM(ok) ok FROM aprs_tx WHERE ts LIKE ?',
             (today + '%',)) or {}
-        pos = self.position.get()
+        pos = self.position.get(cached_only=True)     # 轮询路径：绝不阻塞读串口
         tnc = self.tnc.status() if self.tnc else {}
         return {
             'ok': True,
@@ -2246,6 +2237,7 @@ class AprsService:
                 'aprs_weather_interval', 'aprs_telemetry_enabled',
                 'aprs_telemetry_interval', 'aprs_status_enabled', 'aprs_status_interval',
                 'aprs_carrier_sense', 'aprs_lat', 'aprs_lon', 'aprs_pos_source',
+                'aprs_gps_port', 'aprs_gps_baud', 'aprs_gnss_max_hacc_m', 'aprs_alt_m',
                 'aprs_map_provider', 'aprs_map_layers', 'aprs_map_tk',
                 'aprs_symbol_table', 'aprs_symbol_code')},
             'next_tx': {k: round(v, 1) for k, v in self.next_tx.items()},
@@ -2258,7 +2250,7 @@ class AprsService:
 
     # ---------------- 位置检索（语音助手的位置类工具）----------------
     def home_position(self):
-        """本站自身位置（手填坐标或 NMEA GPS）。"""
+        """本站自身位置（手填固定坐标 或 GNSS 实时定位）。"""
         try:
             p = self.position.get() or {}
         except Exception:

@@ -371,11 +371,52 @@
       if (!$('#cfg-call').value) $('#cfg-call').value = st.aprs_mycall || '';
       if (!$('#cfg-ssid').value) $('#cfg-ssid').value = st.aprs_ssid || 0;
       if (!$('#cfg-comment').value) $('#cfg-comment').value = st.aprs_comment || '';
-      $('#cfg-pos-source').textContent = (r.position_stat && r.position_stat.source) || 'manual';
-      $('#cfg-pos-stat').textContent = JSON.stringify(r.position_stat || {});
+      // 位置来源：GNSS 或固定坐标。选区只在"用户没动过"时回填，免得把正在改的选择冲掉。
+      if ($('#cfg-pos-source-sel') && !$('#cfg-pos-source-sel').dataset.touched) {
+        $('#cfg-pos-source-sel').value = st.aprs_pos_source || 'manual';
+      }
+      if ($('#cfg-gps-port') && !$('#cfg-gps-port').dataset.touched) {
+        $('#cfg-gps-port').value = st.aprs_gps_port || '';
+      }
+      if ($('#cfg-gps-baud') && !$('#cfg-gps-baud').dataset.touched) {
+        $('#cfg-gps-baud').value = st.aprs_gps_baud || 38400;
+      }
+      if ($('#cfg-gnss-hacc') && !$('#cfg-gnss-hacc').dataset.touched) {
+        $('#cfg-gnss-hacc').value = st.aprs_gnss_max_hacc_m != null
+          ? st.aprs_gnss_max_hacc_m : 100;
+      }
+      renderPosStat(r.position_stat || {}, r.position || {});
 
       if (homeLL && lastGeo) { /* 已由 drawGeo 画过 */ }
     }).catch(function () { });
+  }
+
+  // 位置来源状态：给一句人话，而不是把 JSON 抖在页面上
+  function renderPosStat(pstat, pos) {
+    if (!$('#cfg-pos-stat')) return;
+    var srcLabel = { manual: '手动固定坐标', gnss: 'GNSS 自动', nmea: 'GNSS·NMEA',
+                     ubx: 'GNSS·UBX' }[pstat.source || 'manual'] || (pstat.source || '—');
+    $('#cfg-pos-source').textContent = srcLabel;
+    var bits = [];
+    if (pstat.source === 'manual') {
+      // 回落时也要把原因显示出来：以前只在 ok=false 时才显示 err，
+      // 而"回落到固定坐标"这条路上 ok=true（固定坐标本身有效），
+      // 于是 GNSS 读不到这件事在页面上被完全盖住了。
+      bits.push('固定坐标');
+      if (pos && pos.lat != null) bits.push(pos.lat + ', ' + pos.lon);
+    } else if (pstat.ok) {
+      if (pstat.proto) bits.push('协议 ' + pstat.proto);
+      if (pstat.fix) bits.push('定位 ' + pstat.fix);
+      if (pstat.sats != null) bits.push('星 ' + pstat.sats);
+      if (pstat.hacc_m != null) bits.push('水平精度 ' + pstat.hacc_m + ' m');
+      if (pstat.hdop != null) bits.push('HDOP ' + pstat.hdop);
+      if (pstat.carr) bits.push('载波 ' + pstat.carr);
+      if (pos && pos.lat != null) bits.push(pos.lat + ', ' + pos.lon);
+      var age = pstat.ts ? Math.round(Date.now() / 1000 - pstat.ts) : null;
+      if (age != null) bits.push(age + ' 秒前');
+    }
+    if (pstat.err) bits.push('⚠ ' + pstat.err);
+    $('#cfg-pos-stat').textContent = bits.join(' · ') || '—';
   }
 
   /* ================= 发射 ================= */
@@ -452,8 +493,54 @@
         b.classList.add('active');
         $$('.aprs-pane').forEach(function (p) { p.hidden = p.dataset.apane !== b.dataset.atab; });
         if (b.dataset.atab === 'txlog') loadTxLog();
+        // 打开「本站位置」时立刻取一次真实定位：状态轮询走的是缓存（不阻塞），
+        // 用户真正看这一页时要的是"现在"的读数。
+        if (b.dataset.atab === 'cfg' && window.__aprsReadGnss) {
+          window.__aprsReadGnss(true);
+        }
       });
     });
+
+    // 位置来源相关的控件：标记"用户动过"（loadStatus 就不要再覆盖）
+    ['cfg-pos-source-sel', 'cfg-gps-port', 'cfg-gps-baud', 'cfg-gnss-hacc'].forEach(function (id) {
+      var el = $('#' + id);
+      if (!el) return;
+      el.addEventListener('input', function () { el.dataset.touched = '1'; });
+      el.addEventListener('change', function () { el.dataset.touched = '1'; });
+    });
+
+    // 「读取一次」：立刻真读一次 GNSS（/api/aprs/gnss 走 force=True，不受 5 秒缓存影响）
+    function readGnssOnce(silent) {
+      var tip = $('#cfg-result');
+      if (tip && !silent) tip.textContent = '正在读取 GNSS…';
+      return api('/api/aprs/gnss').then(function (r) {
+        if (r && r.ok !== false) {
+          var p = r.position || {};
+          renderPosStat(r.position_stat || {}, p);
+          if (tip && !silent) {
+            if (p.source === 'manual') {
+              tip.textContent = '没读到 GNSS，已回落到固定坐标';
+            } else {
+              tip.textContent = '读到 ' + (p.lat != null ? p.lat : '?') +
+                ', ' + (p.lon != null ? p.lon : '?') + '（' + (p.fix || '') + '）';
+            }
+          }
+          if (!$('#cfg-lat').value && p.lat != null) {
+            $('#cfg-lat').value = p.lat; $('#cfg-lon').value = p.lon;
+          }
+        } else if (tip && !silent) {
+          tip.textContent = '读取失败：' + ((r && r.error) || '');
+        }
+        return r;
+      }).catch(function (e) {
+        if (tip && !silent) tip.textContent = '读取失败：' + e;
+      });
+    }
+    var gnssBtn = $('#btn-gnss-read');
+    if (gnssBtn) {
+      gnssBtn.addEventListener('click', function () { readGnssOnce(false); });
+    }
+    window.__aprsReadGnss = readGnssOnce;
 
     $('#btn-cfg-save').addEventListener('click', function () {
       var body = {
@@ -462,7 +549,11 @@
         aprs_lat: $('#cfg-lat').value,
         aprs_lon: $('#cfg-lon').value,
         aprs_alt_m: $('#cfg-alt').value,
-        aprs_comment: $('#cfg-comment').value
+        aprs_comment: $('#cfg-comment').value,
+        aprs_pos_source: $('#cfg-pos-source-sel') ? $('#cfg-pos-source-sel').value : 'manual',
+        aprs_gps_port: $('#cfg-gps-port') ? $('#cfg-gps-port').value.trim() : '',
+        aprs_gps_baud: $('#cfg-gps-baud') ? $('#cfg-gps-baud').value : 38400,
+        aprs_gnss_max_hacc_m: $('#cfg-gnss-hacc') ? $('#cfg-gnss-hacc').value : 100
       };
       api('/api/aprs/pos', { method: 'POST', body: JSON.stringify(body) }).then(function (r) {
         if (r && r.ok !== false) {
